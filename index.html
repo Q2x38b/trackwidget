@@ -41,10 +41,11 @@
     position: relative; border-radius: 16px; overflow: hidden; background: #0b0e15; border: 1px solid #1b2133;
     box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset, 0 24px 70px rgba(0,0,0,0.45);
     min-height: 420px;
+    aspect-ratio: 16 / 9;
   }
   .layer { position: absolute; inset: 0; }
   video { width: 100%; height: 100%; object-fit: cover; filter: saturate(0.95) contrast(1.05) brightness(0.95); transform: scaleX(-1); } /* mirrored for natural UX */
-  canvas { width: 100%; height: 100%; display: block; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; }
   .overlay {
     pointer-events: none;
   }
@@ -87,7 +88,7 @@
 
   <div class="stage" id="stage">
     <div class="hint">👆 Pinch to grab</div>
-    <video id="video" class="layer" playsinline muted></video>
+    <video id="video" class="layer hidden" playsinline muted></video>
     <canvas id="canvas" class="layer"></canvas>
     <canvas id="overlay" class="layer overlay"></canvas>
   </div>
@@ -133,15 +134,20 @@ let cameraStream = null;
 let running = false;
 let lastVideoTime = -1;
 
-// Pointer smoothing
+// Pointer + landmark smoothing (One Euro filter)
 let pointer = { x: 0, y: 0, valid: false };
-const SMOOTHING = 0.35;
+let lmFilters = null; // [{fx: OneEuro1D, fy: OneEuro1D}] length = 21 for first hand
+let lastFilterTime = null;
+const ONE_EURO_CFG = { minCutoff: 1.7, beta: 0.6, dCutoff: 1.0 };
+// De-emphasize legacy linear smoothing
+// const SMOOTHING = 0.35; // deprecated by One Euro
 
 // Pinch detection state
 let isPinching = false;
 let pinchStrength = 0; // 0..1
-const PINCH_ON = 0.65;
-const PINCH_OFF = 0.45;
+// Pinch hysteresis thresholds (slightly easier to grab)
+const PINCH_ON = 0.55;
+const PINCH_OFF = 0.40;
 
 // Widgets state
 /** @type {Array<{id:number, x:number, y:number, w:number, h:number, kind:'square'|'circle'|'note'}>} */
@@ -185,6 +191,57 @@ function normToPx(nx, ny) {
   return [px, py];
 }
 
+// One Euro filter implementation for smoother, responsive tracking
+class LowPassFilter {
+  constructor(alpha = 1.0) {
+    this.alpha = alpha;
+    this.initialized = false;
+    this.s = 0;
+  }
+  filter(value, alpha = this.alpha) {
+    if (!this.initialized) {
+      this.initialized = true;
+      this.s = value;
+      return value;
+    }
+    this.s = this.s + alpha * (value - this.s);
+    return this.s;
+  }
+  lastValue() { return this.s; }
+}
+
+function alphaFor(dt, cutoff) {
+  const tau = 1.0 / (2 * Math.PI * cutoff);
+  return 1.0 / (1.0 + tau / dt);
+}
+
+class OneEuro1D {
+  constructor({ minCutoff = 1.7, beta = 0.6, dCutoff = 1.0 } = {}) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.dxFilter = new LowPassFilter();
+    this.xFilter = new LowPassFilter();
+    this.prevX = null;
+  }
+  filter(x, dt) {
+    const dx = this.prevX == null ? 0 : (x - this.prevX) / dt;
+    const edx = this.dxFilter.filter(dx, alphaFor(dt, this.dCutoff));
+    const cutoff = this.minCutoff + this.beta * Math.abs(edx);
+    const result = this.xFilter.filter(x, alphaFor(dt, cutoff));
+    this.prevX = result;
+    return result;
+  }
+}
+
+function ensureLmFilters(count) {
+  if (lmFilters && lmFilters.length === count) return;
+  lmFilters = Array.from({ length: count }, () => ({
+    fx: new OneEuro1D(ONE_EURO_CFG),
+    fy: new OneEuro1D(ONE_EURO_CFG)
+  }));
+}
+
 // Widget helpers
 function spawnWidget(kind, x, y) {
   const baseSize = Math.max(60, Math.min(overlay.width, overlay.height) * 0.08);
@@ -209,16 +266,24 @@ function clearWidgets() {
   widgets = [];
 }
 
+const HIT_EXPAND = 24 * devicePixelRatio; // larger hit targets for easier grabs
+let grabOffsetX = 0, grabOffsetY = 0;    // preserve offset when grabbing
+
 function pickWidget(px, py) {
   // topmost first — iterate from end
   for (let i = widgets.length - 1; i >= 0; i--) {
     const w = widgets[i];
     if (w.kind === 'circle') {
       const dx = px - w.x, dy = py - w.y;
-      if (Math.hypot(dx, dy) <= w.w * 0.5) return w.id;
+      if (Math.hypot(dx, dy) <= w.w * 0.5 + HIT_EXPAND) return w.id;
     } else {
       // square or note are rectangles
-      if (px >= w.x - w.w/2 && px <= w.x + w.w/2 && py >= w.y - w.h/2 && py <= w.y + w.h/2) {
+      if (
+        px >= w.x - w.w/2 - HIT_EXPAND &&
+        px <= w.x + w.w/2 + HIT_EXPAND &&
+        py >= w.y - w.h/2 - HIT_EXPAND &&
+        py <= w.y + w.h/2 + HIT_EXPAND
+      ) {
         return w.id;
       }
     }
@@ -304,7 +369,7 @@ function drawOverlay(results) {
       for (const p of lm) {
         const [x, y] = normToPx(p.x, p.y);
         ctx.beginPath();
-        ctx.arc(x, y, 2.2 * devicePixelRatio, 0, Math.PI * 2);
+        ctx.arc(x, y, 3.0 * devicePixelRatio, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -345,59 +410,78 @@ async function frame() {
     lastVideoTime = video.currentTime;
     results = handLandmarker.detectForVideo(video, now);
 
-    // Extract landmarks of first hand
+    // Extract landmarks of first hand and smooth
     let tip8 = null, tip4 = null;
     if (results?.landmarks?.length) {
       const lms = results.landmarks[0];
-      tip8 = lms[8]; // index fingertip
-      tip4 = lms[4]; // thumb tip
+      ensureLmFilters(lms.length);
 
-      // Smooth pointer
-      const [px, py] = normToPx(tip8.x, tip8.y);
-      if (!pointer.valid) {
-        pointer.x = px;
-        pointer.y = py;
-        pointer.valid = true;
-      } else {
-        pointer.x = lerp(pointer.x, px, SMOOTHING);
-        pointer.y = lerp(pointer.y, py, SMOOTHING);
+      // dt in seconds for One Euro filter
+      let dt = 1 / 60;
+      if (lastFilterTime != null) {
+        dt = (now - lastFilterTime) / 1000;
+        dt = clamp(dt, 1 / 240, 0.1);
       }
+      lastFilterTime = now;
 
-      // Pinch metric in normalized coords: distance between tip4 & tip8
+      // Smooth landmarks in normalized space
+      const smoothed = lms.map((p, i) => ({
+        x: lmFilters[i].fx.filter(p.x, dt),
+        y: lmFilters[i].fy.filter(p.y, dt),
+      }));
+
+      tip8 = smoothed[8];
+      tip4 = smoothed[4];
+
+      // Update pointer
+      const [px, py] = normToPx(tip8.x, tip8.y);
+      pointer.x = px;
+      pointer.y = py;
+      pointer.valid = true;
+
+      // Pinch metric using smoothed landmarks
       const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y));
-      // Heuristic: map small distances ~0.02 => strong pinch
       const mapped = clamp((0.08 - dist) / 0.08, 0, 1);
       const wasPinching = isPinching;
       isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
       pinchStrength = mapped;
 
-      // Drag logic
+      // Drag logic with offset preservation
       if (pointer.valid) {
-        // pointer in overlay pixel space already
         const px2 = pointer.x, py2 = pointer.y;
 
         if (isPinching && grabbedId == null) {
           const hit = pickWidget(px2, py2);
-          if (hit != null) grabbedId = hit;
+          if (hit != null) {
+            const w = widgets.find(v => v.id === hit);
+            if (w) {
+              grabbedId = hit;
+              grabOffsetX = w.x - px2;
+              grabOffsetY = w.y - py2;
+            }
+          }
         }
         if (!isPinching && grabbedId != null) {
           grabbedId = null;
+          grabOffsetX = 0; grabOffsetY = 0;
         }
         if (isPinching && grabbedId != null) {
-          moveWidget(grabbedId, px2, py2);
+          moveWidget(grabbedId, px2 + grabOffsetX, py2 + grabOffsetY);
         }
       }
+
+      // Draw overlay using smoothed landmarks
+      drawOverlay({ landmarks: [smoothed] });
     } else {
       pointer.valid = false;
       isPinching = false;
       grabbedId = null;
+      grabOffsetX = 0; grabOffsetY = 0;
     }
   }
 
   // Draw overlay (clear when no results)
-  if (results) {
-    drawOverlay(results);
-  } else {
+  if (!results) {
     const octx = overlay.getContext('2d');
     octx.clearRect(0, 0, overlay.width, overlay.height);
   }
@@ -426,7 +510,9 @@ async function enableCamera() {
     cameraStream = await navigator.mediaDevices.getUserMedia(preferred);
     video.srcObject = cameraStream;
     await video.play();
-    statusEl.textContent = 'Camera on.';
+    // Keep video hidden; we only use it for tracking input
+    video.classList.add('hidden');
+    statusEl.textContent = 'Camera on (video hidden).';
   } catch (err) {
     console.error(err);
     statusEl.innerHTML = `<span class="err">Camera error:</span> ${err?.message || err}`;
@@ -543,6 +629,8 @@ stage.addEventListener('pointerdown', (e) => {
   const hit = pickWidget(px, py);
   if (hit != null) {
     grabbedId = hit;
+    const w = widgets.find(v => v.id === hit);
+    if (w) { grabOffsetX = w.x - px; grabOffsetY = w.y - py; }
     pointerDown = true;
   }
 });
@@ -551,9 +639,9 @@ window.addEventListener('pointermove', (e) => {
   const rect = overlay.getBoundingClientRect();
   const px = (e.clientX - rect.left) * devicePixelRatio;
   const py = (e.clientY - rect.top) * devicePixelRatio;
-  moveWidget(grabbedId, px, py);
+  moveWidget(grabbedId, px + grabOffsetX, py + grabOffsetY);
 });
-window.addEventListener('pointerup', () => { pointerDown = false; grabbedId = null; });
+window.addEventListener('pointerup', () => { pointerDown = false; grabbedId = null; grabOffsetX = 0; grabOffsetY = 0; });
 
 // Init sizing & default widgets
 window.addEventListener('resize', () => { resizeCanvases(); });
