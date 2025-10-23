@@ -166,6 +166,17 @@ const lerp = (a, b, t) => a + (b - a) * t;
 // Utility: clamp
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+// Promise timeout helper
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms/1000)}s`)), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (err) => { clearTimeout(t); reject(err); }
+    );
+  });
+}
+
 // Map normalized landmark (0..1) to overlay pixel coords (already devicePixelRatio scaled)
 function normToPx(nx, ny) {
   // Video is mirrored (scaleX(-1)), so flip X for more intuitive pointer
@@ -323,15 +334,16 @@ function drawOverlay(results) {
   }
 }
 
-// Run loop
+// Run loop — always render widgets; run inference only when ready
 async function frame() {
-  if (!running || !handLandmarker) { requestAnimationFrame(frame); return; }
   const now = performance.now();
 
-  // Only run inference on new video frames
-  if (video.currentTime !== lastVideoTime) {
+  let results = null;
+  const canDetect = running && handLandmarker && video.readyState >= 2;
+
+  if (canDetect && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
-    const results = handLandmarker.detectForVideo(video, now);
+    results = handLandmarker.detectForVideo(video, now);
 
     // Extract landmarks of first hand
     let tip8 = null, tip4 = null;
@@ -342,8 +354,11 @@ async function frame() {
 
       // Smooth pointer
       const [px, py] = normToPx(tip8.x, tip8.y);
-      if (!pointer.valid) { pointer.x = px; pointer.y = py; pointer.valid = true; }
-      else {
+      if (!pointer.valid) {
+        pointer.x = px;
+        pointer.y = py;
+        pointer.valid = true;
+      } else {
         pointer.x = lerp(pointer.x, px, SMOOTHING);
         pointer.y = lerp(pointer.y, py, SMOOTHING);
       }
@@ -377,8 +392,14 @@ async function frame() {
       isPinching = false;
       grabbedId = null;
     }
+  }
 
+  // Draw overlay (clear when no results)
+  if (results) {
     drawOverlay(results);
+  } else {
+    const octx = overlay.getContext('2d');
+    octx.clearRect(0, 0, overlay.width, overlay.height);
   }
 
   // Always redraw widgets (for smooth drag)
@@ -417,27 +438,65 @@ async function initHandLandmarker() {
   if (handLandmarker) return;
   statusEl.textContent = 'Loading hand model…';
 
-  // Import ESM for tasks-vision from CDN
-  const visionModule = await import('https://unpkg.com/@mediapipe/tasks-vision@latest?module');
+  // Import ESM for tasks-vision from CDN with fallback + timeout
+  const MODULE_URLS = [
+    'https://unpkg.com/@mediapipe/tasks-vision@latest?module',
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest?module'
+  ];
+
+  let visionModule = null;
+  let lastErr = null;
+  for (const url of MODULE_URLS) {
+    try {
+      statusEl.textContent = `Loading hand model… (module)`;
+      visionModule = await withTimeout(import(url), 15000, 'Load tasks-vision module');
+      break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (!visionModule) throw lastErr || new Error('Failed to load tasks-vision module');
 
   const { FilesetResolver, HandLandmarker, VisionRunningMode } = visionModule;
 
-  const filesetResolver = await FilesetResolver.forVisionTasks(
-    // Root of wasm files; CDN hosts them within the package
-    'https://unpkg.com/@mediapipe/tasks-vision@latest/wasm'
-  );
+  // Resolve WASM files (try multiple CDNs)
+  const WASM_ROOTS = [
+    'https://unpkg.com/@mediapipe/tasks-vision@latest/wasm',
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+  ];
+  let filesetResolver = null;
+  lastErr = null;
+  for (const root of WASM_ROOTS) {
+    try {
+      statusEl.textContent = `Loading hand model… (wasm)`;
+      filesetResolver = await withTimeout(
+        FilesetResolver.forVisionTasks(root),
+        15000,
+        'Resolve tasks-vision WASM files'
+      );
+      break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (!filesetResolver) throw lastErr || new Error('Failed to resolve WASM files');
 
-  handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
-    baseOptions: {
-      // Official hosted model asset (float16 variant)
-      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
-    },
-    runningMode: VisionRunningMode.VIDEO,
-    numHands: 1,
-    minHandDetectionConfidence: 0.6,
-    minHandPresenceConfidence: 0.6,
-    minTrackingConfidence: 0.6
-  });
+  // Create detector
+  statusEl.textContent = 'Loading hand model… (graph)';
+  handLandmarker = await withTimeout(
+    HandLandmarker.createFromOptions(filesetResolver, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+      },
+      runningMode: VisionRunningMode.VIDEO,
+      numHands: 1,
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    }),
+    20000,
+    'Create HandLandmarker'
+  );
 
   statusEl.textContent = 'Model ready.';
 }
@@ -445,10 +504,16 @@ async function initHandLandmarker() {
 // Wire UI
 btnStart.addEventListener('click', async () => {
   btnStart.disabled = true;
-  await enableCamera();
-  await initHandLandmarker();
-  running = true;
-  requestAnimationFrame(frame);
+  try {
+    await enableCamera();
+    await initHandLandmarker();
+    running = true;
+  } catch (err) {
+    console.error(err);
+    statusEl.innerHTML = `<span class="err">Start error:</span> ${err?.message || err}`;
+    running = false;
+    btnStart.disabled = false;
+  }
 });
 
 btnReset.addEventListener('click', () => resetWidgets());
@@ -493,6 +558,8 @@ window.addEventListener('resize', () => { resizeCanvases(); });
 resizeCanvases();
 resetWidgets();
 statusEl.textContent = 'Ready. Click “Enable Camera” to start.';
+// Start animation loop immediately so widgets render even before camera/model
+requestAnimationFrame(frame);
 
 </script>
 </body>
