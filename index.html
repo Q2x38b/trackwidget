@@ -58,6 +58,23 @@
   .overlay {
     pointer-events: none;
   }
+  /* Sliders */
+  input[type="range"] {
+    appearance: none;
+    height: 4px;
+    background: #1b2133;
+    border-radius: 999px;
+    outline: none;
+    border: 1px solid #2a3147;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent);
+    border: 1px solid #2a3147;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.05) inset;
+  }
+  input[type="color"] { height: 28px; width: 36px; border-radius: 6px; border: 1px solid #2a3147; background: #111526; }
   footer {
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
     color: var(--muted);
@@ -99,13 +116,27 @@
       <input id="brushSize" type="range" min="2" max="36" value="8" title="Brush size" />
       <button id="btnClearSketch" class="btn">Clear Drawing</button>
       <button id="btnSave" class="btn">Save PNG</button>
+
+      <span class="small" style="margin-left:8px;">| Smooth</span>
+      <label class="small" title="Smoothing cutoff (lower = smoother)">
+        cutoff
+        <input id="smoothingCutoff" type="range" min="0.8" max="4" step="0.1" value="1.7" />
+      </label>
+      <label class="small" title="Smoothing beta (higher = more responsive)">
+        beta
+        <input id="smoothingBeta" type="range" min="0" max="1.5" step="0.05" value="0.6" />
+      </label>
+      <span class="small" style="margin-left:8px;">| Pointer</span>
+      <label class="small" title="Pointer size">
+        size
+        <input id="pointerSize" type="range" min="4" max="20" step="1" value="7" />
+      </label>
     </div>
   </header>
 
   <div class="stage" id="stage">
     <div class="hint">👆 Pinch to grab</div>
     <video id="video" class="layer hidden" playsinline muted></video>
-    <canvas id="webgl" class="layer"></canvas>
     <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
     <canvas id="overlay" class="layer overlay"></canvas>
@@ -150,7 +181,9 @@ const colorPicker = document.getElementById('colorPicker');
 const brushSizeInput = document.getElementById('brushSize');
 const btnClearSketch = document.getElementById('btnClearSketch');
 const btnSave = document.getElementById('btnSave');
-const webgl = document.getElementById('webgl');
+const smoothingCutoffInput = document.getElementById('smoothingCutoff');
+const smoothingBetaInput = document.getElementById('smoothingBeta');
+const pointerSizeInput = document.getElementById('pointerSize');
 const stage = document.getElementById('stage');
 
 let showPointer = true;
@@ -197,9 +230,8 @@ let brushSize = 8; // CSS px (will be scaled by devicePixelRatio)
 const sketchCtx = () => sketch.getContext('2d');
 let lastDoubleClick = 0;
 
-// Depth-compensated pointer mapping (relative with adaptive gain)
-let prevNormX = null, prevNormY = null;
-const REFERENCE_HAND_SPAN = 0.175; // ~normalized palm width at comfortable distance
+// Pointer visuals and smoothing controls
+let pointerRadius = 7; // CSS px
 
 // Fit canvases to stage size
 function resizeCanvases() {
@@ -210,9 +242,6 @@ function resizeCanvases() {
     el.style.width = rect.width + 'px';
     el.style.height = rect.height + 'px';
   }
-  // WebGL canvas size is driven by renderer, but keep CSS size in sync
-  webgl.style.width = rect.width + 'px';
-  webgl.style.height = rect.height + 'px';
 }
 
 // Utility: lerp
@@ -442,7 +471,7 @@ function drawOverlay(results) {
   // pointer
   if (pointer.valid && showPointer) {
     ctx.save();
-    const r = 6.5 * devicePixelRatio;
+    const r = pointerRadius * devicePixelRatio;
     // glow ring if grabbing or hovering over a widget
     const hoveringId = pickWidget(pointer.x, pointer.y);
     const engaging = isPinching || grabbedId != null || hoveringId != null;
@@ -455,13 +484,11 @@ function drawOverlay(results) {
     ctx.fillStyle = '#34c759';
     ctx.fill();
     // subtle ring
-    if (engaging) {
-      ctx.beginPath();
-      ctx.arc(pointer.x, pointer.y, r + 5 * devicePixelRatio, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(52,199,89,0.5)';
-      ctx.lineWidth = 2 * devicePixelRatio;
-      ctx.stroke();
-    }
+    ctx.beginPath();
+    ctx.arc(pointer.x, pointer.y, r + 5 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.strokeStyle = engaging ? 'rgba(52,199,89,0.5)' : 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 2 * devicePixelRatio;
+    ctx.stroke();
     ctx.restore();
   }
 }
@@ -502,23 +529,10 @@ async function frame() {
 
       tip8 = smoothed[8];
       tip4 = smoothed[4];
-
-      // Depth-compensated pointer: integrate normalized deltas with adaptive gain
-      const span = Math.hypot(smoothed[5].x - smoothed[17].x, smoothed[5].y - smoothed[17].y);
-      const gain = clamp(REFERENCE_HAND_SPAN / Math.max(0.05, span), 0.6, 3.2);
-      if (prevNormX == null || prevNormY == null) {
-        // Initialize at center for stability on first detection
-        pointer.x = overlay.width * 0.5;
-        pointer.y = overlay.height * 0.5;
-      } else {
-        const dx = tip8.x - prevNormX; // normalized
-        const dy = tip8.y - prevNormY; // normalized
-        const dpx = -dx * overlay.width; // flip X to match mirrored video
-        const dpy = dy * overlay.height;
-        pointer.x = clamp(pointer.x + dpx * gain, 0, overlay.width);
-        pointer.y = clamp(pointer.y + dpy * gain, 0, overlay.height);
-      }
-      prevNormX = tip8.x; prevNormY = tip8.y;
+      // Direct pixel mapping from smoothed fingertip for accuracy
+      const [px, py] = normToPx(tip8.x, tip8.y);
+      pointer.x = clamp(px, 0, overlay.width);
+      pointer.y = clamp(py, 0, overlay.height);
       pointer.valid = true;
       // stage glow: detected when we have landmarks; engaged when pinching or grabbing
       stage.classList.add('hand-detected');
@@ -600,13 +614,14 @@ async function frame() {
 
   // Draw overlay (pointer and glow)
   drawOverlay(null);
+  statusEl.textContent = isPinching ? 'Pinching' : 'Hand detected.';
     } else {
       pointer.valid = false;
       isPinching = false;
       grabbedId = null;
       grabOffsetX = 0; grabOffsetY = 0;
       isDrawing = false;
-      prevNormX = null; prevNormY = null;
+      statusEl.textContent = 'No hand detected.';
     }
   }
 
@@ -626,11 +641,7 @@ async function frame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawWidgets(ctx);
 
-  // Update 3D rotation and render scene
-  update3DRotation();
-  if (renderer && scene && camera) {
-    renderer.render(scene, camera);
-  }
+  // 3D rendering removed
 
   requestAnimationFrame(frame);
 }
@@ -793,6 +804,36 @@ brushSizeInput.addEventListener('input', (e) => {
   if (!Number.isNaN(v) && v > 0) brushSize = v;
 });
 
+// Pointer and smoothing controls
+if (pointerSizeInput) {
+  pointerSizeInput.addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    if (!Number.isNaN(v) && v > 0) pointerRadius = v;
+  });
+}
+if (smoothingCutoffInput) {
+  smoothingCutoffInput.addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    if (!Number.isNaN(v) && v > 0) {
+      ONE_EURO_CFG.minCutoff = v;
+      if (lmFilters) {
+        for (const f of lmFilters) { f.fx.minCutoff = v; f.fy.minCutoff = v; }
+      }
+    }
+  });
+}
+if (smoothingBetaInput) {
+  smoothingBetaInput.addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    if (!Number.isNaN(v) && v >= 0) {
+      ONE_EURO_CFG.beta = v;
+      if (lmFilters) {
+        for (const f of lmFilters) { f.fx.beta = v; f.fy.beta = v; }
+      }
+    }
+  });
+}
+
 btnClearSketch.addEventListener('click', () => {
   const sctx = sketch.getContext('2d');
   sctx.clearRect(0, 0, sketch.width, sketch.height);
@@ -894,97 +935,12 @@ stage.addEventListener('dblclick', (e) => {
 window.addEventListener('resize', () => { resizeCanvases(); });
 resizeCanvases();
 // Observe stage size changes to keep canvases perfectly fitted
-new ResizeObserver(() => { resizeCanvases(); resizeThree(); }).observe(stage);
+new ResizeObserver(() => { resizeCanvases(); }).observe(stage);
 resetWidgets();
 statusEl.textContent = 'Ready. Click “Enable Camera” to start.';
 // Start animation loop immediately so widgets render even before camera/model
 requestAnimationFrame(frame);
-
-// --- 3D Viewer (Three.js) ---
-let three = null;
-let scene = null, camera = null, renderer = null, modelRoot = null;
-let targetRotX = 0, targetRotY = 0, rotX = 0, rotY = 0;
-
-async function initThree() {
-  try {
-    const THREE_VERSION = '0.160.0';
-    const THREE_URL = `https://esm.sh/three@${THREE_VERSION}`;
-    const GLTF_URL = `https://esm.sh/three@${THREE_VERSION}/examples/jsm/loaders/GLTFLoader.js`;
-    three = await withTimeout(import(THREE_URL), 20000, 'Load three.js');
-    const gltfMod = await withTimeout(import(GLTF_URL), 20000, 'Load GLTFLoader');
-    const { Scene, PerspectiveCamera, WebGLRenderer, Color, AmbientLight, DirectionalLight, TorusKnotGeometry, MeshStandardMaterial, Mesh } = three;
-    const { GLTFLoader } = gltfMod;
-
-    scene = new Scene();
-    scene.background = null;
-    camera = new PerspectiveCamera(45, 16/9, 0.01, 100);
-    camera.position.set(0, 0, 3);
-
-    renderer = new WebGLRenderer({ canvas: webgl, antialias: true, alpha: true });
-    if (renderer.setPixelRatio) renderer.setPixelRatio(devicePixelRatio);
-    // Color space compatibility across versions
-    if (renderer.outputColorSpace !== undefined) {
-      renderer.outputColorSpace = three.SRGBColorSpace || renderer.outputColorSpace;
-    } else if (renderer.outputEncoding !== undefined) {
-      renderer.outputEncoding = three.sRGBEncoding;
-    }
-    resizeThree();
-
-    const amb = new AmbientLight(0xffffff, 0.6);
-    scene.add(amb);
-    const dir = new DirectionalLight(0xffffff, 1.0);
-    dir.position.set(2, 3, 4);
-    scene.add(dir);
-
-    modelRoot = new three.Group();
-    scene.add(modelRoot);
-
-    // Try loading a glTF model; fall back to a TorusKnot if it fails
-    const loader = new GLTFLoader();
-    const MODEL_URL = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF/DamagedHelmet.gltf';
-    try {
-      const gltf = await withTimeout(loader.loadAsync(MODEL_URL), 25000, 'Load glTF model');
-      const obj = gltf.scene;
-      obj.scale.set(1.6, 1.6, 1.6);
-      obj.rotation.set(0, Math.PI, 0);
-      modelRoot.add(obj);
-    } catch (err) {
-      const geo = new TorusKnotGeometry(0.7, 0.25, 160, 32);
-      const mat = new MeshStandardMaterial({ color: 0x5ac8fa, roughness: 0.35, metalness: 0.2 });
-      const mesh = new Mesh(geo, mat);
-      modelRoot.add(mesh);
-    }
-  } catch (err) {
-    console.warn('Three.js init failed:', err);
-  }
-}
-
-function resizeThree() {
-  if (!renderer || !camera) return;
-  const rect = stage.getBoundingClientRect();
-  const w = Math.floor(rect.width * devicePixelRatio);
-  const h = Math.floor(rect.height * devicePixelRatio);
-  renderer.setSize(w, h, false);
-  camera.aspect = rect.width / rect.height;
-  camera.updateProjectionMatrix();
-}
-
-// Update 3D model rotation target from pointer position
-function update3DRotation() {
-  if (!modelRoot || !overlay.width || !overlay.height) return;
-  if (pointer.valid) {
-    const nx = pointer.x / overlay.width;   // 0..1
-    const ny = pointer.y / overlay.height;  // 0..1
-    targetRotY = (nx - 0.5) * 1.8;
-    targetRotX = (0.5 - ny) * 1.2;
-  }
-  rotX = lerp(rotX, targetRotX, 0.08);
-  rotY = lerp(rotY, targetRotY, 0.08);
-  modelRoot.rotation.set(rotX, rotY, 0);
-}
-
-// Kick off 3D once DOM is ready
-initThree();
+// 3D viewer removed
 
 </script>
 </body>
