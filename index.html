@@ -75,29 +75,36 @@
   <header>
     <div class="left">
       <span class="badge">Hand Tracker</span>
-      <div class="small">Pinch thumb + index to grab a widget. Move your hand to drag. Release to drop.</div>
+      <div class="small">Pinch thumb + index to interact. Enable Draw Mode to sketch; release to stop.</div>
     </div>
     <div class="controls">
       <button id="btnStart" class="btn">Enable Camera</button>
       <button id="btnReset" class="btn">Reset Widgets</button>
       <button id="btnSpawn" class="btn">Add Widget</button>
       <button id="btnClear" class="btn">Clear Widgets</button>
-      <button id="toggleLandmarks" class="toggle" data-on="true" aria-pressed="true">Show Landmarks</button>
+      <button id="togglePointer" class="toggle" data-on="true" aria-pressed="true">Show Pointer</button>
+      <span class="small" style="margin-left:8px;">| Drawing</span>
+      <button id="btnDrawMode" class="toggle" data-on="false" aria-pressed="false">Draw Mode</button>
+      <button id="btnEraser" class="toggle" data-on="false" aria-pressed="false" disabled>Eraser</button>
+      <input id="colorPicker" type="color" value="#ff375f" title="Brush color" />
+      <input id="brushSize" type="range" min="2" max="36" value="8" title="Brush size" />
+      <button id="btnClearSketch" class="btn">Clear Drawing</button>
+      <button id="btnSave" class="btn">Save PNG</button>
     </div>
   </header>
 
   <div class="stage" id="stage">
     <div class="hint">👆 Pinch to grab</div>
     <video id="video" class="layer hidden" playsinline muted></video>
+    <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
     <canvas id="overlay" class="layer overlay"></canvas>
   </div>
 
   <footer>
     <div class="legend">
-      <span><span class="dot accent"></span>Index fingertip</span>
-      <span><span class="dot ok"></span>Tracked pointer</span>
-      <span><span class="dot warn"></span>Pinch distance</span>
+      <span><span class="dot ok"></span>Pointer</span>
+      <span>Pinch to draw (when Draw Mode is on)</span>
     </div>
     <div class="status" id="status">Idle.</div>
   </footer>
@@ -119,16 +126,23 @@
 
 const statusEl = document.getElementById('status');
 const video = document.getElementById('video');
+const sketch = document.getElementById('sketch');     // persistent drawing layer
 const canvas = document.getElementById('canvas');     // interaction layer (widgets)
-const overlay = document.getElementById('overlay');   // landmarks & debug
+const overlay = document.getElementById('overlay');   // pointer & debug
 const btnStart = document.getElementById('btnStart');
 const btnReset = document.getElementById('btnReset');
 const btnSpawn = document.getElementById('btnSpawn');
 const btnClear = document.getElementById('btnClear');
-const toggleLandmarks = document.getElementById('toggleLandmarks');
+const togglePointer = document.getElementById('togglePointer');
+const btnDrawMode = document.getElementById('btnDrawMode');
+const btnEraser = document.getElementById('btnEraser');
+const colorPicker = document.getElementById('colorPicker');
+const brushSizeInput = document.getElementById('brushSize');
+const btnClearSketch = document.getElementById('btnClearSketch');
+const btnSave = document.getElementById('btnSave');
 const stage = document.getElementById('stage');
 
-let showLandmarks = true;
+let showPointer = true;
 let handLandmarker = null;
 let cameraStream = null;
 let running = false;
@@ -139,6 +153,9 @@ let pointer = { x: 0, y: 0, valid: false };
 let lmFilters = null; // [{fx: OneEuro1D, fy: OneEuro1D}] length = 21 for first hand
 let lastFilterTime = null;
 const ONE_EURO_CFG = { minCutoff: 1.7, beta: 0.6, dCutoff: 1.0 };
+// Pointer velocity for inertial widget throws
+let prevPointerX = null, prevPointerY = null;
+let pointerVelX = 0, pointerVelY = 0; // px/sec
 // De-emphasize legacy linear smoothing
 // const SMOOTHING = 0.35; // deprecated by One Euro
 
@@ -150,15 +167,24 @@ const PINCH_ON = 0.55;
 const PINCH_OFF = 0.40;
 
 // Widgets state
-/** @type {Array<{id:number, x:number, y:number, w:number, h:number, kind:'square'|'circle'|'note'}>} */
+/** @type {Array<{id:number, x:number, y:number, w:number, h:number, kind:'square'|'circle'|'note', vx?:number, vy?:number}>} */
 let widgets = [];
 let grabbedId = null;
 let nextId = 1;
 
+// Drawing state
+let drawMode = false;
+let eraseMode = false;
+let isDrawing = false;
+let lastDrawX = 0, lastDrawY = 0;
+let brushColor = '#ff375f';
+let brushSize = 8; // CSS px (will be scaled by devicePixelRatio)
+const sketchCtx = () => sketch.getContext('2d');
+
 // Fit canvases to stage size
 function resizeCanvases() {
   const rect = stage.getBoundingClientRect();
-  for (const el of [canvas, overlay]) {
+  for (const el of [sketch, canvas, overlay]) {
     el.width = Math.floor(rect.width * devicePixelRatio);
     el.height = Math.floor(rect.height * devicePixelRatio);
     el.style.width = rect.width + 'px';
@@ -246,11 +272,11 @@ function ensureLmFilters(count) {
 function spawnWidget(kind, x, y) {
   const baseSize = Math.max(60, Math.min(overlay.width, overlay.height) * 0.08);
   if (kind === 'circle') {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind });
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0 });
   } else if (kind === 'note') {
-    widgets.push({ id: nextId++, x, y, w: baseSize * 1.4, h: baseSize * 1.0, kind });
+    widgets.push({ id: nextId++, x, y, w: baseSize * 1.4, h: baseSize * 1.0, kind, vx: 0, vy: 0 });
   } else {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square' });
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0 });
   }
 }
 
@@ -296,6 +322,33 @@ function moveWidget(id, px, py) {
   if (!w) return;
   w.x = clamp(px, w.w/2, overlay.width - w.w/2);
   w.y = clamp(py, w.h/2, overlay.height - w.h/2);
+}
+
+// Basic physics for tossed widgets (inertial glide + bounce + friction)
+function updateWidgetPhysics(dtSec) {
+  if (grabbedId != null) return; // don't update while grabbing
+  if (!Number.isFinite(dtSec) || dtSec <= 0) return;
+  const frictionPerSec = 0.88; // velocity multiplier per second
+  const decay = Math.pow(frictionPerSec, dtSec);
+  const restitution = 0.5; // bounce energy retained
+  for (const w of widgets) {
+    if (!('vx' in w)) { w.vx = 0; w.vy = 0; }
+    // Integrate velocity
+    w.x += w.vx * dtSec;
+    w.y += w.vy * dtSec;
+    // Bounds with bounce
+    const left = w.w/2, right = overlay.width - w.w/2;
+    const top = w.h/2, bottom = overlay.height - w.h/2;
+    if (w.x < left) { w.x = left; w.vx = -w.vx * restitution; }
+    if (w.x > right) { w.x = right; w.vx = -w.vx * restitution; }
+    if (w.y < top) { w.y = top; w.vy = -w.vy * restitution; }
+    if (w.y > bottom) { w.y = bottom; w.vy = -w.vy * restitution; }
+    // Friction
+    w.vx *= decay;
+    w.vy *= decay;
+    // Threshold to stop
+    if (Math.hypot(w.vx, w.vy) < 1) { w.vx = 0; w.vy = 0; }
+  }
 }
 
 function drawWidgets(ctx) {
@@ -358,24 +411,6 @@ function drawOverlay(results) {
   const ctx = overlay.getContext('2d');
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-  if (showLandmarks && results?.landmarks?.length) {
-    ctx.save();
-    ctx.lineWidth = 2 * devicePixelRatio;
-    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
-
-    for (const lm of results.landmarks) {
-      // connections not provided by tasks API directly; we can draw small points
-      for (const p of lm) {
-        const [x, y] = normToPx(p.x, p.y);
-        ctx.beginPath();
-        ctx.arc(x, y, 3.0 * devicePixelRatio, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-    ctx.restore();
-  }
-
   // pointer
   if (pointer.valid) {
     ctx.save();
@@ -385,23 +420,14 @@ function drawOverlay(results) {
     ctx.fill();
     ctx.restore();
   }
-
-  // pinch strength ring
-  if (pointer.valid) {
-    const r = 16 * devicePixelRatio;
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(pointer.x, pointer.y, r, 0, Math.PI * 2 * pinchStrength);
-    ctx.strokeStyle = '#ff9f0a';
-    ctx.lineWidth = 3 * devicePixelRatio;
-    ctx.stroke();
-    ctx.restore();
-  }
 }
 
 // Run loop — always render widgets; run inference only when ready
+let lastFrameTime = null;
 async function frame() {
   const now = performance.now();
+  const dtFrameSec = lastFrameTime == null ? 1/60 : clamp((now - lastFrameTime) / 1000, 1/240, 0.1);
+  lastFrameTime = now;
 
   let results = null;
   const canDetect = running && handLandmarker && video.readyState >= 2;
@@ -438,6 +464,13 @@ async function frame() {
       pointer.x = px;
       pointer.y = py;
       pointer.valid = true;
+      // Pointer velocity (px/sec)
+      if (prevPointerX != null && prevPointerY != null) {
+        pointerVelX = (pointer.x - prevPointerX) / dt;
+        pointerVelY = (pointer.y - prevPointerY) / dt;
+      }
+      prevPointerX = pointer.x;
+      prevPointerY = pointer.y;
 
       // Pinch metric using smoothed landmarks
       const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y));
@@ -446,37 +479,74 @@ async function frame() {
       isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
       pinchStrength = mapped;
 
-      // Drag logic with offset preservation
+      // Interaction: draw or drag
       if (pointer.valid) {
         const px2 = pointer.x, py2 = pointer.y;
-
-        if (isPinching && grabbedId == null) {
-          const hit = pickWidget(px2, py2);
-          if (hit != null) {
-            const w = widgets.find(v => v.id === hit);
-            if (w) {
-              grabbedId = hit;
-              grabOffsetX = w.x - px2;
-              grabOffsetY = w.y - py2;
+        if (drawMode) {
+          // Pinch to draw
+          if (isPinching && !wasPinching) {
+            isDrawing = true;
+            lastDrawX = px2; lastDrawY = py2;
+          }
+          if (isPinching && isDrawing) {
+            const ctxS = sketchCtx();
+            ctxS.save();
+            ctxS.lineCap = 'round';
+            ctxS.lineJoin = 'round';
+            ctxS.lineWidth = brushSize * devicePixelRatio;
+            if (eraseMode) {
+              ctxS.globalCompositeOperation = 'destination-out';
+              ctxS.strokeStyle = 'rgba(0,0,0,1)';
+            } else {
+              ctxS.globalCompositeOperation = 'source-over';
+              ctxS.strokeStyle = brushColor;
+            }
+            ctxS.beginPath();
+            ctxS.moveTo(lastDrawX, lastDrawY);
+            ctxS.lineTo(px2, py2);
+            ctxS.stroke();
+            ctxS.restore();
+            lastDrawX = px2; lastDrawY = py2;
+          }
+          if (!isPinching && wasPinching && isDrawing) {
+            isDrawing = false;
+          }
+        } else {
+          // Widgets: pinch to grab/drag, release to toss with inertia
+          if (isPinching && grabbedId == null) {
+            const hit = pickWidget(px2, py2);
+            if (hit != null) {
+              const w = widgets.find(v => v.id === hit);
+              if (w) {
+                grabbedId = hit;
+                grabOffsetX = w.x - px2;
+                grabOffsetY = w.y - py2;
+                // stop motion while grabbing
+                w.vx = 0; w.vy = 0;
+              }
             }
           }
-        }
-        if (!isPinching && grabbedId != null) {
-          grabbedId = null;
-          grabOffsetX = 0; grabOffsetY = 0;
-        }
-        if (isPinching && grabbedId != null) {
-          moveWidget(grabbedId, px2 + grabOffsetX, py2 + grabOffsetY);
+          if (!isPinching && grabbedId != null) {
+            const releasedId = grabbedId;
+            grabbedId = null;
+            grabOffsetX = 0; grabOffsetY = 0;
+            const w = widgets.find(v => v.id === releasedId);
+            if (w) { w.vx = pointerVelX; w.vy = pointerVelY; }
+          }
+          if (isPinching && grabbedId != null) {
+            moveWidget(grabbedId, px2 + grabOffsetX, py2 + grabOffsetY);
+          }
         }
       }
 
-      // Draw overlay using smoothed landmarks
-      drawOverlay({ landmarks: [smoothed] });
+  // Draw overlay (pointer only)
+  drawOverlay(null);
     } else {
       pointer.valid = false;
       isPinching = false;
       grabbedId = null;
       grabOffsetX = 0; grabOffsetY = 0;
+      isDrawing = false;
     }
   }
 
@@ -485,6 +555,9 @@ async function frame() {
     const octx = overlay.getContext('2d');
     octx.clearRect(0, 0, overlay.width, overlay.height);
   }
+
+  // Update physics for tossed widgets
+  updateWidgetPhysics(dtFrameSec);
 
   // Always redraw widgets (for smooth drag)
   const ctx = canvas.getContext('2d');
@@ -614,34 +687,123 @@ btnSpawn.addEventListener('click', () => {
 });
 btnClear.addEventListener('click', () => clearWidgets());
 
-toggleLandmarks.addEventListener('click', () => {
-  showLandmarks = !showLandmarks;
-  toggleLandmarks.dataset.on = String(showLandmarks);
-  toggleLandmarks.setAttribute('aria-pressed', String(showLandmarks));
+togglePointer.addEventListener('click', () => {
+  showPointer = !showPointer;
+  togglePointer.dataset.on = String(showPointer);
+  togglePointer.setAttribute('aria-pressed', String(showPointer));
 });
 
-// Touch/mouse fallback (lets you drag widgets with finger/mouse, too)
+btnDrawMode.addEventListener('click', () => {
+  drawMode = !drawMode;
+  btnDrawMode.dataset.on = String(drawMode);
+  btnDrawMode.setAttribute('aria-pressed', String(drawMode));
+  // Enable eraser only in draw mode
+  btnEraser.disabled = !drawMode;
+  if (!drawMode) {
+    isDrawing = false;
+    eraseMode = false;
+    btnEraser.dataset.on = 'false';
+    btnEraser.setAttribute('aria-pressed', 'false');
+  }
+});
+
+btnEraser.addEventListener('click', () => {
+  if (btnEraser.disabled) return;
+  eraseMode = !eraseMode;
+  btnEraser.dataset.on = String(eraseMode);
+  btnEraser.setAttribute('aria-pressed', String(eraseMode));
+});
+
+colorPicker.addEventListener('input', (e) => {
+  brushColor = e.target.value || brushColor;
+});
+
+brushSizeInput.addEventListener('input', (e) => {
+  const v = Number(e.target.value);
+  if (!Number.isNaN(v) && v > 0) brushSize = v;
+});
+
+btnClearSketch.addEventListener('click', () => {
+  const sctx = sketch.getContext('2d');
+  sctx.clearRect(0, 0, sketch.width, sketch.height);
+});
+
+btnSave.addEventListener('click', () => {
+  // Compose drawing + widgets into a single PNG (video is excluded)
+  const out = document.createElement('canvas');
+  out.width = overlay.width;
+  out.height = overlay.height;
+  const octx = out.getContext('2d');
+  // Optional background fill
+  octx.fillStyle = '#0b0e15';
+  octx.fillRect(0, 0, out.width, out.height);
+  // Drawing layer
+  octx.drawImage(sketch, 0, 0);
+  // Widgets
+  drawWidgets(octx);
+  const url = out.toDataURL('image/png');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'hand-canvas.png';
+  a.click();
+});
+
+// Touch/mouse fallback (supports widgets drag or drawing)
 let pointerDown = false;
 stage.addEventListener('pointerdown', (e) => {
   const rect = overlay.getBoundingClientRect();
   const px = (e.clientX - rect.left) * devicePixelRatio;
   const py = (e.clientY - rect.top) * devicePixelRatio;
-  const hit = pickWidget(px, py);
-  if (hit != null) {
-    grabbedId = hit;
-    const w = widgets.find(v => v.id === hit);
-    if (w) { grabOffsetX = w.x - px; grabOffsetY = w.y - py; }
-    pointerDown = true;
+  if (drawMode) {
+    isDrawing = true; pointerDown = true; lastDrawX = px; lastDrawY = py;
+  } else {
+    const hit = pickWidget(px, py);
+    if (hit != null) {
+      grabbedId = hit;
+      const w = widgets.find(v => v.id === hit);
+      if (w) { grabOffsetX = w.x - px; grabOffsetY = w.y - py; w.vx = 0; w.vy = 0; }
+      pointerDown = true;
+    }
   }
 });
 window.addEventListener('pointermove', (e) => {
-  if (!pointerDown || grabbedId == null) return;
+  if (!pointerDown) return;
   const rect = overlay.getBoundingClientRect();
   const px = (e.clientX - rect.left) * devicePixelRatio;
   const py = (e.clientY - rect.top) * devicePixelRatio;
-  moveWidget(grabbedId, px + grabOffsetX, py + grabOffsetY);
+  if (drawMode && isDrawing) {
+    const ctxS = sketch.getContext('2d');
+    ctxS.save();
+    ctxS.lineCap = 'round';
+    ctxS.lineJoin = 'round';
+    ctxS.lineWidth = brushSize * devicePixelRatio;
+    if (eraseMode) {
+      ctxS.globalCompositeOperation = 'destination-out';
+      ctxS.strokeStyle = 'rgba(0,0,0,1)';
+    } else {
+      ctxS.globalCompositeOperation = 'source-over';
+      ctxS.strokeStyle = brushColor;
+    }
+    ctxS.beginPath();
+    ctxS.moveTo(lastDrawX, lastDrawY);
+    ctxS.lineTo(px, py);
+    ctxS.stroke();
+    ctxS.restore();
+    lastDrawX = px; lastDrawY = py;
+  } else if (grabbedId != null) {
+    moveWidget(grabbedId, px + grabOffsetX, py + grabOffsetY);
+  }
 });
-window.addEventListener('pointerup', () => { pointerDown = false; grabbedId = null; grabOffsetX = 0; grabOffsetY = 0; });
+window.addEventListener('pointerup', () => {
+  if (drawMode) {
+    isDrawing = false; pointerDown = false;
+  } else {
+    const releasedId = grabbedId;
+    pointerDown = false; grabbedId = null; grabOffsetX = 0; grabOffsetY = 0;
+    const w = widgets.find(v => v.id === releasedId);
+    if (w) { w.vx = pointerVelX; w.vy = pointerVelY; }
+  }
+});
 
 // Init sizing & default widgets
 window.addEventListener('resize', () => { resizeCanvases(); });
