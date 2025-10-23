@@ -120,11 +120,11 @@
       <span class="small" style="margin-left:8px;">| Smooth</span>
       <label class="small" title="Smoothing cutoff (lower = smoother)">
         cutoff
-        <input id="smoothingCutoff" type="range" min="0.8" max="4" step="0.1" value="1.7" />
+        <input id="smoothingCutoff" type="range" min="0.8" max="4" step="0.1" value="1.4" />
       </label>
       <label class="small" title="Smoothing beta (higher = more responsive)">
         beta
-        <input id="smoothingBeta" type="range" min="0" max="1.5" step="0.05" value="0.6" />
+        <input id="smoothingBeta" type="range" min="0" max="1.5" step="0.05" value="0.8" />
       </label>
       <span class="small" style="margin-left:8px;">| Pointer</span>
       <label class="small" title="Pointer size">
@@ -203,15 +203,18 @@ let hands = Array.from({ length: MAX_HANDS }, () => ({
   wasPinching: false,
   pinchStrength: 0,
   rawPinchDist: 0,
+  pinchOnCount: 0,
+  pinchOffCount: 0,
 }));
 let lastFilterTime = null;
-const ONE_EURO_CFG = { minCutoff: 1.7, beta: 0.6, dCutoff: 1.0 };
+const ONE_EURO_CFG = { minCutoff: 1.4, beta: 0.8, dCutoff: 1.0 };
 
-// Pinch detection thresholds
-// Each hand maintains its own isPinching/pinchStrength state
-// Pinch hysteresis thresholds (slightly easier to grab)
-const PINCH_ON = 0.55;
-const PINCH_OFF = 0.38;
+// Pinch detection thresholds and debounce
+// Dynamic pinch mapping + hysteresis + short debounce for stability
+const PINCH_ON = 0.58;
+const PINCH_OFF = 0.40;
+const PINCH_ON_FRAMES = 3;  // consecutive frames required to start pinch
+const PINCH_OFF_FRAMES = 2; // consecutive frames required to end pinch
 
 // Widgets state
 /**
@@ -546,21 +549,43 @@ async function frame() {
         const tip8 = smoothed[8];
         const tip4 = smoothed[4];
         const [px, py] = normToPx(tip8.x, tip8.y);
-        hands[i].x = clamp(px, 0, overlay.width);
-        hands[i].y = clamp(py, 0, overlay.height);
-        hands[i].valid = true;
-        stage.classList.add('hand-detected');
+        const h = hands[i];
+        h.x = clamp(px, 0, overlay.width);
+        h.y = clamp(py, 0, overlay.height);
+        h.valid = true;
 
-        const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized space
-        const mapped = clamp((0.08 - dist) / 0.08, 0, 1);
-        const was = hands[i].wasPinching;
-        hands[i].isPinching = was ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
-        hands[i].pinchStrength = mapped;
-        hands[i].rawPinchDist = dist;
+        // Dynamic pinch mapping using palm width as reference
+        const mcp5 = smoothed[5];
+        const mcp17 = smoothed[17];
+        const palmWidth = Math.hypot(mcp5.x - mcp17.x, mcp5.y - mcp17.y) || 0.001;
+        const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized
+        const baseline = clamp(palmWidth * 0.45, 0.04, 0.14);
+        const mapped = clamp((baseline - dist) / baseline, 0, 1);
+        const was = h.wasPinching;
+
+        // Debounced hysteresis
+        if (mapped > PINCH_ON) {
+          h.pinchOnCount = Math.min(h.pinchOnCount + 1, 10);
+        } else {
+          h.pinchOnCount = 0;
+        }
+        if (mapped <= PINCH_OFF) {
+          h.pinchOffCount = Math.min(h.pinchOffCount + 1, 10);
+        } else {
+          h.pinchOffCount = 0;
+        }
+        if (!was) {
+          h.isPinching = h.pinchOnCount >= PINCH_ON_FRAMES;
+        } else {
+          h.isPinching = !(h.pinchOffCount >= PINCH_OFF_FRAMES);
+        }
+        h.pinchStrength = mapped;
+        h.rawPinchDist = dist;
       }
 
       // Interaction
       const anyValid = hands.some(h => h.valid);
+      stage.classList.toggle('hand-detected', anyValid);
       if (anyValid) {
         if (drawMode) {
           // Use dominant hand: grabbing hand if present, else first valid
@@ -689,12 +714,18 @@ async function frame() {
       for (let i = 0; i < MAX_HANDS; i++) {
         hands[i].valid = false;
         hands[i].isPinching = false;
+        hands[i].pinchOnCount = 0;
+        hands[i].pinchOffCount = 0;
       }
       grabbedId = null;
       grabOffsetX = 0; grabOffsetY = 0;
       grabHand = null; resizeHand = null;
       isDrawing = false;
       statusEl.textContent = 'No hand detected.';
+      // Hide pointer immediately when no hands detected in this frame
+      const octx = overlay.getContext('2d');
+      octx.clearRect(0, 0, overlay.width, overlay.height);
+      stage.classList.remove('hand-detected');
     }
   }
 
@@ -803,9 +834,9 @@ async function initHandLandmarker() {
       },
       runningMode: 'VIDEO',
       numHands: 2,
-      minHandDetectionConfidence: 0.6,
-      minHandPresenceConfidence: 0.6,
-      minTrackingConfidence: 0.6
+      minHandDetectionConfidence: 0.7,
+      minHandPresenceConfidence: 0.7,
+      minTrackingConfidence: 0.7
     }),
     60000,
     'Create HandLandmarker'
@@ -889,8 +920,10 @@ if (smoothingCutoffInput) {
     const v = Number(e.target.value);
     if (!Number.isNaN(v) && v > 0) {
       ONE_EURO_CFG.minCutoff = v;
-      if (lmFilters) {
-        for (const f of lmFilters) { f.fx.minCutoff = v; f.fy.minCutoff = v; }
+      // Update all existing per-hand filters
+      for (const h of hands) {
+        if (!h.lmFilters) continue;
+        for (const f of h.lmFilters) { f.fx.minCutoff = v; f.fy.minCutoff = v; }
       }
     }
   });
@@ -900,8 +933,10 @@ if (smoothingBetaInput) {
     const v = Number(e.target.value);
     if (!Number.isNaN(v) && v >= 0) {
       ONE_EURO_CFG.beta = v;
-      if (lmFilters) {
-        for (const f of lmFilters) { f.fx.beta = v; f.fy.beta = v; }
+      // Update all existing per-hand filters
+      for (const h of hands) {
+        if (!h.lmFilters) continue;
+        for (const f of h.lmFilters) { f.fx.beta = v; f.fy.beta = v; }
       }
     }
   });
