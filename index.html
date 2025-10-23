@@ -439,9 +439,11 @@ async function initHandLandmarker() {
   statusEl.textContent = 'Loading hand model…';
 
   // Import ESM for tasks-vision from CDN with fallback + timeout
+  const TASKS_VISION_VERSION = '0.10.12';
   const MODULE_URLS = [
-    'https://unpkg.com/@mediapipe/tasks-vision@latest?module',
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest?module'
+    `https://unpkg.com/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}?module`,
+    `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}?module`,
+    `https://esm.run/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}`
   ];
 
   let visionModule = null;
@@ -461,8 +463,8 @@ async function initHandLandmarker() {
 
   // Resolve WASM files (try multiple CDNs)
   const WASM_ROOTS = [
-    'https://unpkg.com/@mediapipe/tasks-vision@latest/wasm',
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+    `https://unpkg.com/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}/wasm`,
+    `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}/wasm`
   ];
   let filesetResolver = null;
   lastErr = null;
@@ -494,7 +496,7 @@ async function initHandLandmarker() {
       minHandPresenceConfidence: 0.6,
       minTrackingConfidence: 0.6
     }),
-    20000,
+    60000,
     'Create HandLandmarker'
   );
 
