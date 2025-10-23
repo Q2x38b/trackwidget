@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hand Tracker Canvas — Client-Side</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #151821;
+    --text: #e8eaf0;
+    --muted: #8b93a7;
+    --accent: #5ac8fa;
+    --ok: #34c759;
+    --warn: #ff9f0a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: radial-gradient(1200px 800px at 80% -10%, #121521, #0d0f14 45%, #0a0c10 100%); color: var(--text); font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, sans-serif; }
+  .app {
+    display: grid; grid-template-rows: auto 1fr auto; gap: 10px; height: 100%; padding: 14px; max-width: 1100px; margin: 0 auto;
+  }
+  header {
+    display: flex; gap: 12px; align-items: center; justify-content: space-between;
+    background: linear-gradient(180deg, #171a23 0%, #121520 100%); border: 1px solid #22283a; border-radius: 14px; padding: 10px 12px;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 14px 40px rgba(0,0,0,0.35);
+  }
+  header .left { display: flex; gap: 10px; align-items: center; }
+  .badge {
+    border: 1px solid #283047; background: #121728; padding: 6px 10px; border-radius: 999px; color: var(--muted);
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .btn, .toggle {
+    appearance: none; border: 1px solid #2a3147; background: #141828; color: var(--text);
+    padding: 8px 10px; border-radius: 10px; cursor: pointer; transition: 120ms transform ease, 120ms background ease, 120ms border-color ease;
+  }
+  .btn:hover, .toggle:hover { transform: translateY(-1px); border-color: #39425e; }
+  .btn:active, .toggle:active { transform: translateY(0); }
+  .toggle[data-on="true"] { background: #0f1b2e; border-color: #3d6ea3; box-shadow: 0 0 0 1px #284a72 inset; }
+  .small { font-size: 12px; color: var(--muted); }
+  .stage {
+    position: relative; border-radius: 16px; overflow: hidden; background: #0b0e15; border: 1px solid #1b2133;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset, 0 24px 70px rgba(0,0,0,0.45);
+    min-height: 420px;
+  }
+  .layer { position: absolute; inset: 0; }
+  video { width: 100%; height: 100%; object-fit: cover; filter: saturate(0.95) contrast(1.05) brightness(0.95); transform: scaleX(-1); } /* mirrored for natural UX */
+  canvas { width: 100%; height: 100%; display: block; }
+  .overlay {
+    pointer-events: none;
+  }
+  footer {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    color: var(--muted);
+  }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+  .dot.accent { background: var(--accent); }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .status { color: var(--muted); }
+  .err { color: #ff453a; }
+  .hidden { display: none !important; }
+
+  /* Widget styling hints for hover/tap */
+  .hint {
+    position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,0.45); border: 1px solid #2a3147;
+    padding: 6px 10px; border-radius: 999px; font-size: 12px; color: #cdd3e2;
+    backdrop-filter: blur(8px);
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="left">
+      <span class="badge">Hand Tracker</span>
+      <div class="small">Pinch thumb + index to grab a widget. Move your hand to drag. Release to drop.</div>
+    </div>
+    <div class="controls">
+      <button id="btnStart" class="btn">Enable Camera</button>
+      <button id="btnReset" class="btn">Reset Widgets</button>
+      <button id="btnSpawn" class="btn">Add Widget</button>
+      <button id="btnClear" class="btn">Clear Widgets</button>
+      <button id="toggleLandmarks" class="toggle" data-on="true" aria-pressed="true">Show Landmarks</button>
+    </div>
+  </header>
+
+  <div class="stage" id="stage">
+    <div class="hint">👆 Pinch to grab</div>
+    <video id="video" class="layer" playsinline muted></video>
+    <canvas id="canvas" class="layer"></canvas>
+    <canvas id="overlay" class="layer overlay"></canvas>
+  </div>
+
+  <footer>
+    <div class="legend">
+      <span><span class="dot accent"></span>Index fingertip</span>
+      <span><span class="dot ok"></span>Tracked pointer</span>
+      <span><span class="dot warn"></span>Pinch distance</span>
+    </div>
+    <div class="status" id="status">Idle.</div>
+  </footer>
+</div>
+
+<!-- Hand tracking with MediaPipe Tasks Vision (WASM, fully client-side) -->
+<script type="module">
+/**
+ * Fully client-side hand tracker using MediaPipe Tasks Vision (WASM).
+ * - Detects hand landmarks from your webcam.
+ * - Uses index fingertip (landmark 8) as a pointer.
+ * - Uses thumb tip (4) + index tip (8) distance to detect pinch (grab).
+ * - Lets you drag "widgets" (shapes) around a canvas with a pinch gesture.
+ *
+ * Notes:
+ * - All processing happens locally in your browser.
+ * - Mirrored video for natural left/right motion.
+ */
+
+const statusEl = document.getElementById('status');
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');     // interaction layer (widgets)
+const overlay = document.getElementById('overlay');   // landmarks & debug
+const btnStart = document.getElementById('btnStart');
+const btnReset = document.getElementById('btnReset');
+const btnSpawn = document.getElementById('btnSpawn');
+const btnClear = document.getElementById('btnClear');
+const toggleLandmarks = document.getElementById('toggleLandmarks');
+const stage = document.getElementById('stage');
+
+let showLandmarks = true;
+let handLandmarker = null;
+let cameraStream = null;
+let running = false;
+let lastVideoTime = -1;
+
+// Pointer smoothing
+let pointer = { x: 0, y: 0, valid: false };
+const SMOOTHING = 0.35;
+
+// Pinch detection state
+let isPinching = false;
+let pinchStrength = 0; // 0..1
+const PINCH_ON = 0.65;
+const PINCH_OFF = 0.45;
+
+// Widgets state
+/** @type {Array<{id:number, x:number, y:number, w:number, h:number, kind:'square'|'circle'|'note'}>} */
+let widgets = [];
+let grabbedId = null;
+let nextId = 1;
+
+// Fit canvases to stage size
+function resizeCanvases() {
+  const rect = stage.getBoundingClientRect();
+  for (const el of [canvas, overlay]) {
+    el.width = Math.floor(rect.width * devicePixelRatio);
+    el.height = Math.floor(rect.height * devicePixelRatio);
+    el.style.width = rect.width + 'px';
+    el.style.height = rect.height + 'px';
+  }
+}
+
+// Utility: lerp
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// Utility: clamp
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// Map normalized landmark (0..1) to overlay pixel coords (already devicePixelRatio scaled)
+function normToPx(nx, ny) {
+  // Video is mirrored (scaleX(-1)), so flip X for more intuitive pointer
+  const px = (1 - nx) * overlay.width;
+  const py = ny * overlay.height;
+  return [px, py];
+}
+
+// Widget helpers
+function spawnWidget(kind, x, y) {
+  const baseSize = Math.max(60, Math.min(overlay.width, overlay.height) * 0.08);
+  if (kind === 'circle') {
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind });
+  } else if (kind === 'note') {
+    widgets.push({ id: nextId++, x, y, w: baseSize * 1.4, h: baseSize * 1.0, kind });
+  } else {
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square' });
+  }
+}
+
+function resetWidgets() {
+  widgets = [];
+  const cx = overlay.width * 0.33, cy = overlay.height * 0.55;
+  spawnWidget('square', cx - 90, cy);
+  spawnWidget('circle', cx + 90, cy - 30);
+  spawnWidget('note', cx + 20, cy + 90);
+}
+
+function clearWidgets() {
+  widgets = [];
+}
+
+function pickWidget(px, py) {
+  // topmost first — iterate from end
+  for (let i = widgets.length - 1; i >= 0; i--) {
+    const w = widgets[i];
+    if (w.kind === 'circle') {
+      const dx = px - w.x, dy = py - w.y;
+      if (Math.hypot(dx, dy) <= w.w * 0.5) return w.id;
+    } else {
+      // square or note are rectangles
+      if (px >= w.x - w.w/2 && px <= w.x + w.w/2 && py >= w.y - w.h/2 && py <= w.y + w.h/2) {
+        return w.id;
+      }
+    }
+  }
+  return null;
+}
+
+function moveWidget(id, px, py) {
+  const w = widgets.find(v => v.id === id);
+  if (!w) return;
+  w.x = clamp(px, w.w/2, overlay.width - w.w/2);
+  w.y = clamp(py, w.h/2, overlay.height - w.h/2);
+}
+
+function drawWidgets(ctx) {
+  ctx.save();
+  ctx.scale(1, 1);
+  for (const w of widgets) {
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    // cards glow
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 18 * devicePixelRatio;
+    ctx.lineWidth = 2 * devicePixelRatio;
+
+    if (w.kind === 'circle') {
+      const r = w.w * 0.5;
+      const g = (grabbedId === w.id) ? 'rgba(90,200,250,0.9)' : 'rgba(90,200,250,0.35)';
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(20,24,40,0.9)';
+      ctx.strokeStyle = g;
+      ctx.fill();
+      ctx.stroke();
+    } else {
+      const radius = 14 * devicePixelRatio;
+      const ww = w.w, hh = w.h;
+      roundRectPath(ctx, -ww/2, -hh/2, ww, hh, radius);
+      ctx.fillStyle = 'rgba(20,24,40,0.9)';
+      ctx.fill();
+      ctx.strokeStyle = (grabbedId === w.id) ? 'rgba(90,200,250,0.9)' : 'rgba(90,200,250,0.35)';
+      ctx.stroke();
+
+      // A little header bar for notes
+      if (w.kind === 'note') {
+        ctx.save();
+        ctx.beginPath();
+        roundRectPath(ctx, -ww/2, -hh/2, ww, 18 * devicePixelRatio, radius);
+        ctx.fillStyle = 'rgba(90,200,250,0.15)';
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+// Draw overlay (landmarks, pointer, pinch)
+function drawOverlay(results) {
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+  if (showLandmarks && results?.landmarks?.length) {
+    ctx.save();
+    ctx.lineWidth = 2 * devicePixelRatio;
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+
+    for (const lm of results.landmarks) {
+      // connections not provided by tasks API directly; we can draw small points
+      for (const p of lm) {
+        const [x, y] = normToPx(p.x, p.y);
+        ctx.beginPath();
+        ctx.arc(x, y, 2.2 * devicePixelRatio, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  // pointer
+  if (pointer.valid) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(pointer.x, pointer.y, 5.5 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.fillStyle = '#34c759';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // pinch strength ring
+  if (pointer.valid) {
+    const r = 16 * devicePixelRatio;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(pointer.x, pointer.y, r, 0, Math.PI * 2 * pinchStrength);
+    ctx.strokeStyle = '#ff9f0a';
+    ctx.lineWidth = 3 * devicePixelRatio;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// Run loop
+async function frame() {
+  if (!running || !handLandmarker) { requestAnimationFrame(frame); return; }
+  const now = performance.now();
+
+  // Only run inference on new video frames
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const results = handLandmarker.detectForVideo(video, now);
+
+    // Extract landmarks of first hand
+    let tip8 = null, tip4 = null;
+    if (results?.landmarks?.length) {
+      const lms = results.landmarks[0];
+      tip8 = lms[8]; // index fingertip
+      tip4 = lms[4]; // thumb tip
+
+      // Smooth pointer
+      const [px, py] = normToPx(tip8.x, tip8.y);
+      if (!pointer.valid) { pointer.x = px; pointer.y = py; pointer.valid = true; }
+      else {
+        pointer.x = lerp(pointer.x, px, SMOOTHING);
+        pointer.y = lerp(pointer.y, py, SMOOTHING);
+      }
+
+      // Pinch metric in normalized coords: distance between tip4 & tip8
+      const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y));
+      // Heuristic: map small distances ~0.02 => strong pinch
+      const mapped = clamp((0.08 - dist) / 0.08, 0, 1);
+      const wasPinching = isPinching;
+      isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
+      pinchStrength = mapped;
+
+      // Drag logic
+      if (pointer.valid) {
+        // pointer in overlay pixel space already
+        const px2 = pointer.x, py2 = pointer.y;
+
+        if (isPinching && grabbedId == null) {
+          const hit = pickWidget(px2, py2);
+          if (hit != null) grabbedId = hit;
+        }
+        if (!isPinching && grabbedId != null) {
+          grabbedId = null;
+        }
+        if (isPinching && grabbedId != null) {
+          moveWidget(grabbedId, px2, py2);
+        }
+      }
+    } else {
+      pointer.valid = false;
+      isPinching = false;
+      grabbedId = null;
+    }
+
+    drawOverlay(results);
+  }
+
+  // Always redraw widgets (for smooth drag)
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawWidgets(ctx);
+
+  requestAnimationFrame(frame);
+}
+
+// Camera setup
+async function enableCamera() {
+  if (cameraStream) return;
+  try {
+    statusEl.textContent = 'Requesting camera…';
+    const preferred = {
+      audio: false,
+      video: {
+        facingMode: 'user',
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    };
+    cameraStream = await navigator.mediaDevices.getUserMedia(preferred);
+    video.srcObject = cameraStream;
+    await video.play();
+    statusEl.textContent = 'Camera on.';
+  } catch (err) {
+    console.error(err);
+    statusEl.innerHTML = `<span class="err">Camera error:</span> ${err?.message || err}`;
+  }
+}
+
+// Load MediaPipe HandLandmarker (WASM)
+async function initHandLandmarker() {
+  if (handLandmarker) return;
+  statusEl.textContent = 'Loading hand model…';
+
+  // Import ESM for tasks-vision from CDN
+  const visionModule = await import('https://unpkg.com/@mediapipe/tasks-vision@latest?module');
+
+  const { FilesetResolver, HandLandmarker, VisionRunningMode } = visionModule;
+
+  const filesetResolver = await FilesetResolver.forVisionTasks(
+    // Root of wasm files; CDN hosts them within the package
+    'https://unpkg.com/@mediapipe/tasks-vision@latest/wasm'
+  );
+
+  handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      // Official hosted model asset (float16 variant)
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+    },
+    runningMode: VisionRunningMode.VIDEO,
+    numHands: 1,
+    minHandDetectionConfidence: 0.6,
+    minHandPresenceConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+
+  statusEl.textContent = 'Model ready.';
+}
+
+// Wire UI
+btnStart.addEventListener('click', async () => {
+  btnStart.disabled = true;
+  await enableCamera();
+  await initHandLandmarker();
+  running = true;
+  requestAnimationFrame(frame);
+});
+
+btnReset.addEventListener('click', () => resetWidgets());
+btnSpawn.addEventListener('click', () => {
+  const kinds = ['square', 'circle', 'note'];
+  const kind = kinds[Math.floor(Math.random() * kinds.length)];
+  const x = overlay.width * (0.25 + Math.random() * 0.5);
+  const y = overlay.height * (0.25 + Math.random() * 0.5);
+  spawnWidget(kind, x, y);
+});
+btnClear.addEventListener('click', () => clearWidgets());
+
+toggleLandmarks.addEventListener('click', () => {
+  showLandmarks = !showLandmarks;
+  toggleLandmarks.dataset.on = String(showLandmarks);
+  toggleLandmarks.setAttribute('aria-pressed', String(showLandmarks));
+});
+
+// Touch/mouse fallback (lets you drag widgets with finger/mouse, too)
+let pointerDown = false;
+stage.addEventListener('pointerdown', (e) => {
+  const rect = overlay.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * devicePixelRatio;
+  const py = (e.clientY - rect.top) * devicePixelRatio;
+  const hit = pickWidget(px, py);
+  if (hit != null) {
+    grabbedId = hit;
+    pointerDown = true;
+  }
+});
+window.addEventListener('pointermove', (e) => {
+  if (!pointerDown || grabbedId == null) return;
+  const rect = overlay.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * devicePixelRatio;
+  const py = (e.clientY - rect.top) * devicePixelRatio;
+  moveWidget(grabbedId, px, py);
+});
+window.addEventListener('pointerup', () => { pointerDown = false; grabbedId = null; });
+
+// Init sizing & default widgets
+window.addEventListener('resize', () => { resizeCanvases(); });
+resizeCanvases();
+resetWidgets();
+statusEl.textContent = 'Ready. Click “Enable Camera” to start.';
+
+</script>
+</body>
+</html>
