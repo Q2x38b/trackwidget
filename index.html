@@ -87,7 +87,6 @@
 
   <div class="stage" id="stage">
     <div class="hint">👆 Pinch to grab</div>
-    <video id="video" class="layer" playsinline muted></video>
     <canvas id="canvas" class="layer"></canvas>
     <canvas id="overlay" class="layer overlay"></canvas>
   </div>
@@ -117,7 +116,11 @@
  */
 
 const statusEl = document.getElementById('status');
-const video = document.getElementById('video');
+// Use an offscreen video element (not displayed) to feed the hand tracker
+const video = document.createElement('video');
+video.setAttribute('playsinline', 'true');
+video.muted = true;
+video.autoplay = true;
 const canvas = document.getElementById('canvas');     // interaction layer (widgets)
 const overlay = document.getElementById('overlay');   // landmarks & debug
 const btnStart = document.getElementById('btnStart');
@@ -132,22 +135,31 @@ let handLandmarker = null;
 let cameraStream = null;
 let running = false;
 let lastVideoTime = -1;
+let lastLandmarksTime = 0;
+let smoothedLmsPx = null; // Array of hands -> array of smoothed {x,y}
+const LM_SMOOTH_ALPHA = 0.35;
 
-// Pointer smoothing
+// Pointer smoothing (dynamic)
 let pointer = { x: 0, y: 0, valid: false };
-const SMOOTHING = 0.35;
+const POINTER_MIN_ALPHA = 0.18; // slow movements => stronger smoothing
+const POINTER_MAX_ALPHA = 0.55; // fast movements => lighter smoothing
+const POINTER_SMOOTH_DIST = 24; // px distance scale for dynamic alpha
+const POINTER_GRACE_MS = 140; // grace period to keep pointer during brief dropouts
 
-// Pinch detection state
+// Pinch detection state (smoothed)
 let isPinching = false;
-let pinchStrength = 0; // 0..1
-const PINCH_ON = 0.65;
-const PINCH_OFF = 0.45;
+let pinchStrength = 0; // 0..1 smoothed
+const PINCH_ON = 0.55;
+const PINCH_OFF = 0.35;
+const PINCH_SMOOTH_ALPHA = 0.45;
 
 // Widgets state
 /** @type {Array<{id:number, x:number, y:number, w:number, h:number, kind:'square'|'circle'|'note'}>} */
 let widgets = [];
 let grabbedId = null;
+let grabOffset = { x: 0, y: 0 }; // keep pointer->center offset when grabbing
 let nextId = 1;
+const GRAB_RADIUS_PX = 28 * devicePixelRatio; // forgiving hit radius near edges
 
 // Fit canvases to stage size
 function resizeCanvases() {
@@ -226,6 +238,27 @@ function pickWidget(px, py) {
   return null;
 }
 
+// Forgiving pick: allow selecting a widget if the pointer is within a radius
+function pickWidgetLoose(px, py, radiusPx) {
+  const direct = pickWidget(px, py);
+  if (direct != null) return direct;
+  for (let i = widgets.length - 1; i >= 0; i--) {
+    const w = widgets[i];
+    if (w.kind === 'circle') {
+      const dx = Math.abs(px - w.x), dy = Math.abs(py - w.y);
+      const distFromEdge = Math.max(Math.hypot(dx, dy) - w.w * 0.5, 0);
+      if (distFromEdge <= radiusPx) return w.id;
+    } else {
+      // Distance from rectangle
+      const dx = Math.max(Math.abs(px - w.x) - w.w/2, 0);
+      const dy = Math.max(Math.abs(py - w.y) - w.h/2, 0);
+      const dist = Math.hypot(dx, dy);
+      if (dist <= radiusPx) return w.id;
+    }
+  }
+  return null;
+}
+
 function moveWidget(id, px, py) {
   const w = widgets.find(v => v.id === id);
   if (!w) return;
@@ -289,22 +322,21 @@ function roundRectPath(ctx, x, y, w, h, r) {
 }
 
 // Draw overlay (landmarks, pointer, pinch)
-function drawOverlay(results) {
+function drawOverlay() {
   const ctx = overlay.getContext('2d');
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-  if (showLandmarks && results?.landmarks?.length) {
+  if (showLandmarks && smoothedLmsPx?.length) {
     ctx.save();
     ctx.lineWidth = 2 * devicePixelRatio;
     ctx.strokeStyle = 'rgba(255,255,255,0.15)';
     ctx.fillStyle = 'rgba(255,255,255,0.7)';
 
-    for (const lm of results.landmarks) {
-      // connections not provided by tasks API directly; we can draw small points
+    for (const lm of smoothedLmsPx) {
+      // draw small points
       for (const p of lm) {
-        const [x, y] = normToPx(p.x, p.y);
         ctx.beginPath();
-        ctx.arc(x, y, 2.2 * devicePixelRatio, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, 2.2 * devicePixelRatio, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -338,71 +370,101 @@ function drawOverlay(results) {
 async function frame() {
   const now = performance.now();
 
-  let results = null;
   const canDetect = running && handLandmarker && video.readyState >= 2;
-
   if (canDetect && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
-    results = handLandmarker.detectForVideo(video, now);
+    const results = handLandmarker.detectForVideo(video, now);
 
     // Extract landmarks of first hand
-    let tip8 = null, tip4 = null;
     if (results?.landmarks?.length) {
-      const lms = results.landmarks[0];
-      tip8 = lms[8]; // index fingertip
-      tip4 = lms[4]; // thumb tip
+      const hands = results.landmarks;
 
-      // Smooth pointer
-      const [px, py] = normToPx(tip8.x, tip8.y);
+      // Smooth all visible landmarks into pixel space
+      if (!smoothedLmsPx || smoothedLmsPx.length !== hands.length) {
+        smoothedLmsPx = hands.map(() => []);
+      }
+      hands.forEach((lm, handIdx) => {
+        const sm = smoothedLmsPx[handIdx] || [];
+        for (let i = 0; i < lm.length; i++) {
+          const [pxi, pyi] = normToPx(lm[i].x, lm[i].y);
+          if (!sm[i]) {
+            sm[i] = { x: pxi, y: pyi };
+          } else {
+            sm[i].x = lerp(sm[i].x, pxi, LM_SMOOTH_ALPHA);
+            sm[i].y = lerp(sm[i].y, pyi, LM_SMOOTH_ALPHA);
+          }
+        }
+        smoothedLmsPx[handIdx] = sm;
+      });
+
+      const lms = hands[0];
+      const tip8 = lms[8]; // index fingertip
+      const tip4 = lms[4]; // thumb tip
+
+      // Pointer smoothing with dynamic alpha based on movement
+      let [px, py] = normToPx(tip8.x, tip8.y);
+      if (smoothedLmsPx && smoothedLmsPx[0]?.[8]) {
+        px = smoothedLmsPx[0][8].x;
+        py = smoothedLmsPx[0][8].y;
+      }
       if (!pointer.valid) {
         pointer.x = px;
         pointer.y = py;
         pointer.valid = true;
       } else {
-        pointer.x = lerp(pointer.x, px, SMOOTHING);
-        pointer.y = lerp(pointer.y, py, SMOOTHING);
+        const dx = px - pointer.x, dy = py - pointer.y;
+        const dist = Math.hypot(dx, dy);
+        const t = clamp(dist / POINTER_SMOOTH_DIST, 0, 1);
+        const alpha = POINTER_MIN_ALPHA + (POINTER_MAX_ALPHA - POINTER_MIN_ALPHA) * t;
+        pointer.x = lerp(pointer.x, px, alpha);
+        pointer.y = lerp(pointer.y, py, alpha);
       }
+      lastLandmarksTime = now;
 
       // Pinch metric in normalized coords: distance between tip4 & tip8
-      const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y));
+      const distNorm = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y));
       // Heuristic: map small distances ~0.02 => strong pinch
-      const mapped = clamp((0.08 - dist) / 0.08, 0, 1);
+      const mapped = clamp((0.08 - distNorm) / 0.08, 0, 1);
+      // Smooth pinch strength
+      pinchStrength = lerp(pinchStrength, mapped, PINCH_SMOOTH_ALPHA);
       const wasPinching = isPinching;
-      isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
-      pinchStrength = mapped;
-
-      // Drag logic
-      if (pointer.valid) {
-        // pointer in overlay pixel space already
-        const px2 = pointer.x, py2 = pointer.y;
-
-        if (isPinching && grabbedId == null) {
-          const hit = pickWidget(px2, py2);
-          if (hit != null) grabbedId = hit;
-        }
-        if (!isPinching && grabbedId != null) {
-          grabbedId = null;
-        }
-        if (isPinching && grabbedId != null) {
-          moveWidget(grabbedId, px2, py2);
-        }
-      }
-    } else {
-      pointer.valid = false;
-      isPinching = false;
-      grabbedId = null;
+      isPinching = wasPinching ? (pinchStrength > PINCH_OFF) : (pinchStrength > PINCH_ON);
     }
   }
 
-  // Draw overlay (clear when no results)
-  if (results) {
-    drawOverlay(results);
-  } else {
-    const octx = overlay.getContext('2d');
-    octx.clearRect(0, 0, overlay.width, overlay.height);
+  // If we haven't seen landmarks recently, invalidate pointer with a grace window
+  if (pointer.valid && (now - lastLandmarksTime) > POINTER_GRACE_MS) {
+    pointer.valid = false;
+    isPinching = false;
+    grabbedId = null;
   }
 
-  // Always redraw widgets (for smooth drag)
+  // Drag logic runs every frame using latest pointer state
+  if (pointer.valid) {
+    const px2 = pointer.x, py2 = pointer.y;
+    if (isPinching && grabbedId == null) {
+      const hit = pickWidgetLoose(px2, py2, GRAB_RADIUS_PX * 1.2);
+      if (hit != null) {
+        grabbedId = hit;
+        const w = widgets.find(v => v.id === hit);
+        if (w) {
+          grabOffset.x = w.x - px2;
+          grabOffset.y = w.y - py2;
+        } else {
+          grabOffset.x = 0; grabOffset.y = 0;
+        }
+      }
+    }
+    if (!isPinching && grabbedId != null) {
+      grabbedId = null;
+    }
+    if (isPinching && grabbedId != null) {
+      moveWidget(grabbedId, px2 + grabOffset.x, py2 + grabOffset.y);
+    }
+  }
+
+  // Draw overlay and widgets every frame
+  drawOverlay();
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawWidgets(ctx);
