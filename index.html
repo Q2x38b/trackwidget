@@ -101,7 +101,7 @@
   <header>
     <div class="left">
       <span class="badge">Hand Tracker</span>
-      <div class="small">Pinch thumb + index to interact. Enable Draw Mode to sketch; release to stop.</div>
+      <div class="small">Pinch thumb + index to interact. Grab with one hand; pinch with the other to resize. Enable Draw Mode to sketch; release to stop.</div>
     </div>
     <div class="controls">
       <button id="btnStart" class="btn">Enable Camera</button>
@@ -135,7 +135,7 @@
   </header>
 
   <div class="stage" id="stage">
-    <div class="hint">👆 Pinch to grab</div>
+    <div class="hint">🤏 Grab with one hand; pinch other to resize</div>
     <video id="video" class="layer hidden" playsinline muted></video>
     <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
@@ -192,20 +192,23 @@ let cameraStream = null;
 let running = false;
 let lastVideoTime = -1;
 
-// Pointer + landmark smoothing (One Euro filter)
-let pointer = { x: 0, y: 0, valid: false };
-let lmFilters = null; // [{fx: OneEuro1D, fy: OneEuro1D}] length = 21 for first hand
+// Pointer + landmark smoothing (One Euro filter) — multi-hand
+const MAX_HANDS = 2;
+/** @typedef {{x:number,y:number,valid:boolean,lmFilters:null|Array<{fx:OneEuro1D,fy:OneEuro1D}>,isPinching:boolean,wasPinching:boolean,pinchStrength:number,rawPinchDist:number}} HandState */
+/** @type {Array<HandState>} */
+let hands = Array.from({ length: MAX_HANDS }, () => ({
+  x: 0, y: 0, valid: false,
+  lmFilters: null,
+  isPinching: false,
+  wasPinching: false,
+  pinchStrength: 0,
+  rawPinchDist: 0,
+}));
 let lastFilterTime = null;
 const ONE_EURO_CFG = { minCutoff: 1.7, beta: 0.6, dCutoff: 1.0 };
-// Pointer velocity for inertial widget throws
-let prevPointerX = null, prevPointerY = null;
-let pointerVelX = 0, pointerVelY = 0; // px/sec
-// De-emphasize legacy linear smoothing
-// const SMOOTHING = 0.35; // deprecated by One Euro
 
-// Pinch detection state
-let isPinching = false;
-let pinchStrength = 0; // 0..1
+// Pinch detection thresholds
+// Each hand maintains its own isPinching/pinchStrength state
 // Pinch hysteresis thresholds (slightly easier to grab)
 const PINCH_ON = 0.55;
 const PINCH_OFF = 0.40;
@@ -218,6 +221,11 @@ const PINCH_OFF = 0.40;
 /** @type {Array<Widget>} */
 let widgets = [];
 let grabbedId = null;
+let grabHand = null;        // 0 or 1
+// Resize with the other hand's pinch-open distance
+let resizeHand = null;      // 0 or 1 (the non-grabbing hand)
+let resizeBaseDist = 0;     // normalized distance at start of resize
+let resizeBaseW = 0, resizeBaseH = 0; // widget size at start of resize
 let nextId = 1;
 
 // Drawing state
@@ -312,9 +320,10 @@ class OneEuro1D {
   }
 }
 
-function ensureLmFilters(count) {
-  if (lmFilters && lmFilters.length === count) return;
-  lmFilters = Array.from({ length: count }, () => ({
+function ensureLmFiltersForHand(handIdx, count) {
+  const hs = hands[handIdx];
+  if (hs.lmFilters && hs.lmFilters.length === count) return;
+  hs.lmFilters = Array.from({ length: count }, () => ({
     fx: new OneEuro1D(ONE_EURO_CFG),
     fy: new OneEuro1D(ONE_EURO_CFG)
   }));
@@ -464,29 +473,32 @@ function drawWidgetText(ctx, text, w, h, opts = {}) {
 // Clock widget removed
 
 // Draw overlay (landmarks, pointer, pinch)
-function drawOverlay(results) {
+function drawOverlay() {
   const ctx = overlay.getContext('2d');
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-  // pointer
-  if (pointer.valid && showPointer) {
+  if (!showPointer) return;
+
+  for (let i = 0; i < MAX_HANDS; i++) {
+    const h = hands[i];
+    if (!h.valid) continue;
     ctx.save();
     const r = pointerRadius * devicePixelRatio;
-    // glow ring if grabbing or hovering over a widget
-    const hoveringId = pickWidget(pointer.x, pointer.y);
-    const engaging = isPinching || grabbedId != null || hoveringId != null;
+    const hoveringId = pickWidget(h.x, h.y);
+    const isGrabbingHand = grabHand === i && grabbedId != null;
+    const engaging = isGrabbingHand || hoveringId != null || h.isPinching;
     if (engaging) {
-      ctx.shadowColor = 'rgba(52,199,89,0.65)';
+      ctx.shadowColor = i === grabHand ? 'rgba(90,200,250,0.65)' : 'rgba(52,199,89,0.65)';
       ctx.shadowBlur = 14 * devicePixelRatio;
     }
     ctx.beginPath();
-    ctx.arc(pointer.x, pointer.y, r, 0, Math.PI * 2);
-    ctx.fillStyle = '#34c759';
+    ctx.arc(h.x, h.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = i === grabHand ? '#5ac8fa' : '#34c759';
     ctx.fill();
-    // subtle ring
+    // ring
     ctx.beginPath();
-    ctx.arc(pointer.x, pointer.y, r + 5 * devicePixelRatio, 0, Math.PI * 2);
-    ctx.strokeStyle = engaging ? 'rgba(52,199,89,0.5)' : 'rgba(255,255,255,0.18)';
+    ctx.arc(h.x, h.y, r + 5 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.strokeStyle = engaging ? (i === grabHand ? 'rgba(90,200,250,0.5)' : 'rgba(52,199,89,0.5)') : 'rgba(255,255,255,0.18)';
     ctx.lineWidth = 2 * devicePixelRatio;
     ctx.stroke();
     ctx.restore();
@@ -507,12 +519,13 @@ async function frame() {
     lastVideoTime = video.currentTime;
     results = handLandmarker.detectForVideo(video, now);
 
-    // Extract landmarks of first hand and smooth
-    let tip8 = null, tip4 = null;
-    if (results?.landmarks?.length) {
-      const lms = results.landmarks[0];
-      ensureLmFilters(lms.length);
+    // Reset validity for this frame
+    for (let i = 0; i < MAX_HANDS; i++) {
+      hands[i].valid = false;
+      hands[i].wasPinching = hands[i].isPinching;
+    }
 
+    if (results?.landmarks?.length) {
       // dt in seconds for One Euro filter
       let dt = 1 / 60;
       if (lastFilterTime != null) {
@@ -521,105 +534,165 @@ async function frame() {
       }
       lastFilterTime = now;
 
-      // Smooth landmarks in normalized space
-      const smoothed = lms.map((p, i) => ({
-        x: lmFilters[i].fx.filter(p.x, dt),
-        y: lmFilters[i].fy.filter(p.y, dt),
-      }));
+      // For up to MAX_HANDS, smooth and populate state
+      for (let i = 0; i < Math.min(MAX_HANDS, results.landmarks.length); i++) {
+        const lms = results.landmarks[i];
+        ensureLmFiltersForHand(i, lms.length);
+        const filters = hands[i].lmFilters;
+        const smoothed = lms.map((p, j) => ({
+          x: filters[j].fx.filter(p.x, dt),
+          y: filters[j].fy.filter(p.y, dt),
+        }));
+        const tip8 = smoothed[8];
+        const tip4 = smoothed[4];
+        const [px, py] = normToPx(tip8.x, tip8.y);
+        hands[i].x = clamp(px, 0, overlay.width);
+        hands[i].y = clamp(py, 0, overlay.height);
+        hands[i].valid = true;
+        stage.classList.add('hand-detected');
 
-      tip8 = smoothed[8];
-      tip4 = smoothed[4];
-      // Direct pixel mapping from smoothed fingertip for accuracy
-      const [px, py] = normToPx(tip8.x, tip8.y);
-      pointer.x = clamp(px, 0, overlay.width);
-      pointer.y = clamp(py, 0, overlay.height);
-      pointer.valid = true;
-      // stage glow: detected when we have landmarks; engaged when pinching or grabbing
-      stage.classList.add('hand-detected');
-      // Pointer velocity (px/sec)
-      if (prevPointerX != null && prevPointerY != null) {
-        pointerVelX = (pointer.x - prevPointerX) / dt;
-        pointerVelY = (pointer.y - prevPointerY) / dt;
+        const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized space
+        const mapped = clamp((0.08 - dist) / 0.08, 0, 1);
+        const was = hands[i].wasPinching;
+        hands[i].isPinching = was ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
+        hands[i].pinchStrength = mapped;
+        hands[i].rawPinchDist = dist;
       }
-      prevPointerX = pointer.x;
-      prevPointerY = pointer.y;
 
-      // Pinch metric using smoothed landmarks
-      const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y));
-      const mapped = clamp((0.08 - dist) / 0.08, 0, 1);
-      const wasPinching = isPinching;
-      isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
-      pinchStrength = mapped;
-      // Border glow now reflects only detection state, not pinch/engagement
-
-      // Interaction: draw or drag
-      if (pointer.valid) {
-        const px2 = pointer.x, py2 = pointer.y;
+      // Interaction
+      const anyValid = hands.some(h => h.valid);
+      if (anyValid) {
         if (drawMode) {
-          // Pinch to draw
-          if (isPinching && !wasPinching) {
-            isDrawing = true;
-            lastDrawX = px2; lastDrawY = py2;
-          }
-          if (isPinching && isDrawing) {
-            const ctxS = sketchCtx();
-            ctxS.save();
-            ctxS.lineCap = 'round';
-            ctxS.lineJoin = 'round';
-            ctxS.lineWidth = brushSize * devicePixelRatio;
-            if (eraseMode) {
-              ctxS.globalCompositeOperation = 'destination-out';
-              ctxS.strokeStyle = 'rgba(0,0,0,1)';
-            } else {
-              ctxS.globalCompositeOperation = 'source-over';
-              ctxS.strokeStyle = brushColor;
+          // Use dominant hand: grabbing hand if present, else first valid
+          const dom = grabHand != null ? grabHand : (hands[0].valid ? 0 : (hands[1].valid ? 1 : null));
+          if (dom != null) {
+            const px2 = hands[dom].x, py2 = hands[dom].y;
+            const wasPinching = hands[dom].wasPinching;
+            const nowPinching = hands[dom].isPinching;
+            if (nowPinching && !wasPinching) {
+              isDrawing = true;
+              lastDrawX = px2; lastDrawY = py2;
             }
-            ctxS.beginPath();
-            ctxS.moveTo(lastDrawX, lastDrawY);
-            ctxS.lineTo(px2, py2);
-            ctxS.stroke();
-            ctxS.restore();
-            lastDrawX = px2; lastDrawY = py2;
-          }
-          if (!isPinching && wasPinching && isDrawing) {
-            isDrawing = false;
+            if (nowPinching && isDrawing) {
+              const ctxS = sketchCtx();
+              ctxS.save();
+              ctxS.lineCap = 'round';
+              ctxS.lineJoin = 'round';
+              ctxS.lineWidth = brushSize * devicePixelRatio;
+              if (eraseMode) {
+                ctxS.globalCompositeOperation = 'destination-out';
+                ctxS.strokeStyle = 'rgba(0,0,0,1)';
+              } else {
+                ctxS.globalCompositeOperation = 'source-over';
+                ctxS.strokeStyle = brushColor;
+              }
+              ctxS.beginPath();
+              ctxS.moveTo(lastDrawX, lastDrawY);
+              ctxS.lineTo(px2, py2);
+              ctxS.stroke();
+              ctxS.restore();
+              lastDrawX = px2; lastDrawY = py2;
+            }
+            if (!nowPinching && wasPinching && isDrawing) {
+              isDrawing = false;
+            }
           }
         } else {
-          // Widgets: pinch to grab/drag, release to toss with inertia
-          if (isPinching && grabbedId == null) {
-            const hit = pickWidget(px2, py2);
-            if (hit != null) {
-              const w = widgets.find(v => v.id === hit);
-              if (w) {
-                grabbedId = hit;
-                grabOffsetX = w.x - px2;
-                grabOffsetY = w.y - py2;
-                // stop motion while grabbing
-                w.vx = 0; w.vy = 0;
+          // Grab with one hand; resize with the other
+          if (grabbedId == null) {
+            // Look for a pinch start over a widget on any hand
+            for (let i = 0; i < MAX_HANDS; i++) {
+              const h = hands[i];
+              if (!h.valid) continue;
+              if (h.isPinching && !h.wasPinching) {
+                const hit = pickWidget(h.x, h.y);
+                if (hit != null) {
+                  const w = widgets.find(v => v.id === hit);
+                  if (w) {
+                    grabbedId = hit;
+                    grabHand = i;
+                    grabOffsetX = w.x - h.x;
+                    grabOffsetY = w.y - h.y;
+                    w.vx = 0; w.vy = 0;
+                  }
+                  break;
+                }
               }
             }
           }
-          if (!isPinching && grabbedId != null) {
-            const releasedId = grabbedId;
-            grabbedId = null;
-            grabOffsetX = 0; grabOffsetY = 0;
-            const w = widgets.find(v => v.id === releasedId);
-            if (w) { w.vx = 0; w.vy = 0; }
-          }
-          if (isPinching && grabbedId != null) {
-            moveWidget(grabbedId, px2 + grabOffsetX, py2 + grabOffsetY);
+
+          if (grabbedId != null && grabHand != null) {
+            const gh = hands[grabHand];
+            const w = widgets.find(v => v.id === grabbedId);
+            if (!w) {
+              grabbedId = null; grabHand = null; resizeHand = null;
+            } else {
+              // Move while grab hand keeps pinching
+              if (gh.isPinching) {
+                moveWidget(grabbedId, gh.x + grabOffsetX, gh.y + grabOffsetY);
+              } else {
+                // Release
+                const releasedId = grabbedId;
+                grabbedId = null; grabHand = null; grabOffsetX = 0; grabOffsetY = 0;
+                const ww = widgets.find(v => v.id === releasedId);
+                if (ww) { ww.vx = 0; ww.vy = 0; }
+                resizeHand = null;
+              }
+
+              // Resize with the other hand's pinch distance
+              if (grabbedId != null) {
+                const other = grabHand === 0 ? 1 : 0;
+                const oh = hands[other];
+                if (oh && oh.valid) {
+                  const minSize = 40 * devicePixelRatio;
+                  const maxSize = Math.min(overlay.width, overlay.height) * 0.8;
+                  if (oh.isPinching) {
+                    if (resizeHand == null) {
+                      // Begin resize
+                      resizeHand = other;
+                      resizeBaseDist = Math.max(oh.rawPinchDist, 0.001);
+                      resizeBaseW = w.w;
+                      resizeBaseH = w.h;
+                    }
+                    if (resizeHand === other) {
+                      const scale = clamp(oh.rawPinchDist / resizeBaseDist, 0.5, 3.0);
+                      w.w = clamp(resizeBaseW * scale, minSize, maxSize);
+                      // keep aspect ratio for each widget
+                      const aspect = resizeBaseH / Math.max(1, resizeBaseW);
+                      w.h = clamp(w.w * aspect, minSize * 0.6, maxSize);
+                    }
+                  } else if (resizeHand === other) {
+                    // End resize on release
+                    resizeHand = null;
+                  }
+                } else {
+                  resizeHand = null;
+                }
+              }
+            }
           }
         }
       }
 
-  // Draw overlay (pointer and glow)
-  drawOverlay(null);
-  statusEl.textContent = isPinching ? 'Pinching' : 'Hand detected.';
+      // Overlay + status
+      drawOverlay();
+      if (grabbedId != null && resizeHand != null) {
+        statusEl.textContent = 'Resizing';
+      } else if (grabbedId != null) {
+        statusEl.textContent = 'Grabbing';
+      } else if (hands.some(h => h.isPinching)) {
+        statusEl.textContent = 'Pinching';
+      } else {
+        statusEl.textContent = 'Hand detected.';
+      }
     } else {
-      pointer.valid = false;
-      isPinching = false;
+      for (let i = 0; i < MAX_HANDS; i++) {
+        hands[i].valid = false;
+        hands[i].isPinching = false;
+      }
       grabbedId = null;
       grabOffsetX = 0; grabOffsetY = 0;
+      grabHand = null; resizeHand = null;
       isDrawing = false;
       statusEl.textContent = 'No hand detected.';
     }
@@ -729,7 +802,7 @@ async function initHandLandmarker() {
         modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
       },
       runningMode: 'VIDEO',
-      numHands: 1,
+      numHands: 2,
       minHandDetectionConfidence: 0.6,
       minHandPresenceConfidence: 0.6,
       minTrackingConfidence: 0.6
