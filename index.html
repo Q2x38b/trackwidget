@@ -42,6 +42,20 @@
     box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset, 0 24px 70px rgba(0,0,0,0.45);
     min-height: 420px;
     aspect-ratio: 16 / 9;
+    transition: box-shadow 160ms ease, border-color 160ms ease;
+  }
+  /* Stage glow states */
+  .stage.hand-detected {
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset,
+                0 24px 70px rgba(0,0,0,0.45),
+                0 0 16px 2px rgba(90,200,250,0.25);
+    border-color: #28486e;
+  }
+  .stage.hand-engaged {
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset,
+                0 24px 70px rgba(0,0,0,0.45),
+                0 0 22px 4px rgba(90,200,250,0.4);
+    border-color: #2e6aa5;
   }
   .layer { position: absolute; inset: 0; }
   video { width: 100%; height: 100%; object-fit: cover; filter: saturate(0.95) contrast(1.05) brightness(0.95); transform: scaleX(-1); } /* mirrored for natural UX */
@@ -81,6 +95,9 @@
       <button id="btnStart" class="btn">Enable Camera</button>
       <button id="btnReset" class="btn">Reset Widgets</button>
       <button id="btnSpawn" class="btn">Add Widget</button>
+      <button id="btnAddLabel" class="btn">Add Label</button>
+      <button id="btnAddClock" class="btn">Add Clock</button>
+      <button id="btnAddSticker" class="btn">Add Sticker</button>
       <button id="btnClear" class="btn">Clear Widgets</button>
       <button id="togglePointer" class="toggle" data-on="true" aria-pressed="true">Show Pointer</button>
       <span class="small" style="margin-left:8px;">| Drawing</span>
@@ -140,6 +157,9 @@ const colorPicker = document.getElementById('colorPicker');
 const brushSizeInput = document.getElementById('brushSize');
 const btnClearSketch = document.getElementById('btnClearSketch');
 const btnSave = document.getElementById('btnSave');
+const btnAddLabel = document.getElementById('btnAddLabel');
+const btnAddClock = document.getElementById('btnAddClock');
+const btnAddSticker = document.getElementById('btnAddSticker');
 const stage = document.getElementById('stage');
 
 let showPointer = true;
@@ -167,7 +187,11 @@ const PINCH_ON = 0.55;
 const PINCH_OFF = 0.40;
 
 // Widgets state
-/** @type {Array<{id:number, x:number, y:number, w:number, h:number, kind:'square'|'circle'|'note', vx?:number, vy?:number}>} */
+/**
+ * @typedef {'square'|'circle'|'note'|'label'|'clock'|'sticker'} WidgetKind
+ * @typedef {{id:number, x:number, y:number, w:number, h:number, kind:WidgetKind, vx?:number, vy?:number, text?:string, emoji?:string}} Widget
+ */
+/** @type {Array<Widget>} */
 let widgets = [];
 let grabbedId = null;
 let nextId = 1;
@@ -180,6 +204,7 @@ let lastDrawX = 0, lastDrawY = 0;
 let brushColor = '#ff375f';
 let brushSize = 8; // CSS px (will be scaled by devicePixelRatio)
 const sketchCtx = () => sketch.getContext('2d');
+let lastDoubleClick = 0;
 
 // Fit canvases to stage size
 function resizeCanvases() {
@@ -274,7 +299,13 @@ function spawnWidget(kind, x, y) {
   if (kind === 'circle') {
     widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0 });
   } else if (kind === 'note') {
-    widgets.push({ id: nextId++, x, y, w: baseSize * 1.4, h: baseSize * 1.0, kind, vx: 0, vy: 0 });
+    widgets.push({ id: nextId++, x, y, w: baseSize * 1.6, h: baseSize * 1.1, kind, vx: 0, vy: 0, text: 'Note' });
+  } else if (kind === 'label') {
+    widgets.push({ id: nextId++, x, y, w: baseSize * 1.8, h: baseSize * 0.7, kind, vx: 0, vy: 0, text: 'Label' });
+  } else if (kind === 'clock') {
+    widgets.push({ id: nextId++, x, y, w: baseSize * 1.2, h: baseSize * 1.2, kind, vx: 0, vy: 0 });
+  } else if (kind === 'sticker') {
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0, emoji: '⭐️' });
   } else {
     widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0 });
   }
@@ -324,31 +355,9 @@ function moveWidget(id, px, py) {
   w.y = clamp(py, w.h/2, overlay.height - w.h/2);
 }
 
-// Basic physics for tossed widgets (inertial glide + bounce + friction)
+// Physics disabled: widgets stay where released
 function updateWidgetPhysics(dtSec) {
-  if (grabbedId != null) return; // don't update while grabbing
-  if (!Number.isFinite(dtSec) || dtSec <= 0) return;
-  const frictionPerSec = 0.88; // velocity multiplier per second
-  const decay = Math.pow(frictionPerSec, dtSec);
-  const restitution = 0.5; // bounce energy retained
-  for (const w of widgets) {
-    if (!('vx' in w)) { w.vx = 0; w.vy = 0; }
-    // Integrate velocity
-    w.x += w.vx * dtSec;
-    w.y += w.vy * dtSec;
-    // Bounds with bounce
-    const left = w.w/2, right = overlay.width - w.w/2;
-    const top = w.h/2, bottom = overlay.height - w.h/2;
-    if (w.x < left) { w.x = left; w.vx = -w.vx * restitution; }
-    if (w.x > right) { w.x = right; w.vx = -w.vx * restitution; }
-    if (w.y < top) { w.y = top; w.vy = -w.vy * restitution; }
-    if (w.y > bottom) { w.y = bottom; w.vy = -w.vy * restitution; }
-    // Friction
-    w.vx *= decay;
-    w.vy *= decay;
-    // Threshold to stop
-    if (Math.hypot(w.vx, w.vy) < 1) { w.vx = 0; w.vy = 0; }
-  }
+  // Intentionally no-op to remove inertia/gravity
 }
 
 function drawWidgets(ctx) {
@@ -362,7 +371,7 @@ function drawWidgets(ctx) {
     ctx.shadowBlur = 18 * devicePixelRatio;
     ctx.lineWidth = 2 * devicePixelRatio;
 
-    if (w.kind === 'circle') {
+    if (w.kind === 'circle' || w.kind === 'clock') {
       const r = w.w * 0.5;
       const g = (grabbedId === w.id) ? 'rgba(90,200,250,0.9)' : 'rgba(90,200,250,0.35)';
       ctx.beginPath();
@@ -371,6 +380,10 @@ function drawWidgets(ctx) {
       ctx.strokeStyle = g;
       ctx.fill();
       ctx.stroke();
+      // Clock face
+      if (w.kind === 'clock') {
+        drawClock(ctx, w.w);
+      }
     } else {
       const radius = 14 * devicePixelRatio;
       const ww = w.w, hh = w.h;
@@ -388,6 +401,18 @@ function drawWidgets(ctx) {
         ctx.fillStyle = 'rgba(90,200,250,0.15)';
         ctx.fill();
         ctx.restore();
+        // Note text
+        drawWidgetText(ctx, w.text || 'Note', ww, hh, { topPadding: 26 * devicePixelRatio });
+      } else if (w.kind === 'label') {
+        drawWidgetText(ctx, w.text || 'Label', ww, hh, { center: true });
+      } else if (w.kind === 'sticker') {
+        // Big emoji centered
+        const fontPx = Math.floor(Math.min(ww, hh) * 0.6);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `${fontPx}px system-ui, Apple Color Emoji, Segoe UI Emoji`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(w.emoji || '⭐️', 0, 0);
       }
     }
     ctx.restore();
@@ -406,6 +431,65 @@ function roundRectPath(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+function drawWidgetText(ctx, text, w, h, opts = {}) {
+  const pad = 10 * devicePixelRatio;
+  const maxWidth = w - pad * 2;
+  const fontPx = Math.max(12 * devicePixelRatio, Math.min(20 * devicePixelRatio, h * 0.28));
+  ctx.fillStyle = '#d7deee';
+  ctx.font = `${fontPx}px/1.2 system-ui, -apple-system, Segoe UI, Inter, Roboto`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  let tx = 0;
+  let ty = 0;
+  if (opts.center) {
+    ty = 0;
+  } else {
+    ty = -h/2 + pad + fontPx * 0.5 + (opts.topPadding || 0);
+  }
+  // Simple truncation if too long
+  let t = String(text);
+  while (ctx.measureText(t).width > maxWidth && t.length > 3) {
+    t = t.slice(0, -2) + '…';
+  }
+  ctx.fillText(t, tx, ty);
+}
+
+function drawClock(ctx, size) {
+  const r = size * 0.5;
+  const now = new Date();
+  const sec = now.getSeconds() + now.getMilliseconds()/1000;
+  const min = now.getMinutes() + sec/60;
+  const hr = (now.getHours()%12) + min/60;
+  ctx.save();
+  // ticks
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  for (let i=0;i<12;i++){
+    const a = (i/12) * Math.PI*2;
+    const inner = r*0.78;
+    const outer = r*0.9;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a)*inner, Math.sin(a)*inner);
+    ctx.lineTo(Math.cos(a)*outer, Math.sin(a)*outer);
+    ctx.stroke();
+  }
+  // hands
+  function hand(angle, length, width, color){
+    ctx.save();
+    ctx.rotate(angle);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.lineTo(length,0);
+    ctx.stroke();
+    ctx.restore();
+  }
+  hand(hr/12 * Math.PI*2, r*0.5, 4*devicePixelRatio, 'rgba(255,255,255,0.9)');
+  hand(min/60 * Math.PI*2, r*0.7, 3*devicePixelRatio, 'rgba(255,255,255,0.85)');
+  hand(sec/60 * Math.PI*2, r*0.8, 2*devicePixelRatio, 'rgba(255,59,48,0.9)');
+  ctx.restore();
+}
+
 // Draw overlay (landmarks, pointer, pinch)
 function drawOverlay(results) {
   const ctx = overlay.getContext('2d');
@@ -414,10 +498,26 @@ function drawOverlay(results) {
   // pointer
   if (pointer.valid) {
     ctx.save();
+    const r = 6.5 * devicePixelRatio;
+    // glow ring if grabbing or hovering over a widget
+    const hoveringId = pickWidget(pointer.x, pointer.y);
+    const engaging = isPinching || grabbedId != null || hoveringId != null;
+    if (engaging) {
+      ctx.shadowColor = 'rgba(52,199,89,0.65)';
+      ctx.shadowBlur = 14 * devicePixelRatio;
+    }
     ctx.beginPath();
-    ctx.arc(pointer.x, pointer.y, 5.5 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.arc(pointer.x, pointer.y, r, 0, Math.PI * 2);
     ctx.fillStyle = '#34c759';
     ctx.fill();
+    // subtle ring
+    if (engaging) {
+      ctx.beginPath();
+      ctx.arc(pointer.x, pointer.y, r + 5 * devicePixelRatio, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(52,199,89,0.5)';
+      ctx.lineWidth = 2 * devicePixelRatio;
+      ctx.stroke();
+    }
     ctx.restore();
   }
 }
@@ -464,6 +564,8 @@ async function frame() {
       pointer.x = px;
       pointer.y = py;
       pointer.valid = true;
+      // stage glow: detected when we have landmarks; engaged when pinching or grabbing
+      stage.classList.add('hand-detected');
       // Pointer velocity (px/sec)
       if (prevPointerX != null && prevPointerY != null) {
         pointerVelX = (pointer.x - prevPointerX) / dt;
@@ -478,6 +580,11 @@ async function frame() {
       const wasPinching = isPinching;
       isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
       pinchStrength = mapped;
+      if (isPinching || grabbedId != null) {
+        stage.classList.add('hand-engaged');
+      } else {
+        stage.classList.remove('hand-engaged');
+      }
 
       // Interaction: draw or drag
       if (pointer.valid) {
@@ -531,7 +638,7 @@ async function frame() {
             grabbedId = null;
             grabOffsetX = 0; grabOffsetY = 0;
             const w = widgets.find(v => v.id === releasedId);
-            if (w) { w.vx = pointerVelX; w.vy = pointerVelY; }
+            if (w) { w.vx = 0; w.vy = 0; }
           }
           if (isPinching && grabbedId != null) {
             moveWidget(grabbedId, px2 + grabOffsetX, py2 + grabOffsetY);
@@ -539,7 +646,7 @@ async function frame() {
         }
       }
 
-  // Draw overlay (pointer only)
+  // Draw overlay (pointer and glow)
   drawOverlay(null);
     } else {
       pointer.valid = false;
@@ -554,6 +661,8 @@ async function frame() {
   if (!results) {
     const octx = overlay.getContext('2d');
     octx.clearRect(0, 0, overlay.width, overlay.height);
+    stage.classList.remove('hand-detected');
+    stage.classList.remove('hand-engaged');
   }
 
   // Update physics for tossed widgets
@@ -687,6 +796,19 @@ btnSpawn.addEventListener('click', () => {
 });
 btnClear.addEventListener('click', () => clearWidgets());
 
+btnAddLabel.addEventListener('click', () => {
+  const x = overlay.width * 0.5, y = overlay.height * 0.35;
+  spawnWidget('label', x, y);
+});
+btnAddClock.addEventListener('click', () => {
+  const x = overlay.width * 0.6, y = overlay.height * 0.5;
+  spawnWidget('clock', x, y);
+});
+btnAddSticker.addEventListener('click', () => {
+  const x = overlay.width * 0.4, y = overlay.height * 0.55;
+  spawnWidget('sticker', x, y);
+});
+
 togglePointer.addEventListener('click', () => {
   showPointer = !showPointer;
   togglePointer.dataset.on = String(showPointer);
@@ -801,7 +923,25 @@ window.addEventListener('pointerup', () => {
     const releasedId = grabbedId;
     pointerDown = false; grabbedId = null; grabOffsetX = 0; grabOffsetY = 0;
     const w = widgets.find(v => v.id === releasedId);
-    if (w) { w.vx = pointerVelX; w.vy = pointerVelY; }
+    if (w) { w.vx = 0; w.vy = 0; }
+  }
+});
+
+// Double-click to edit text on label/note/sticker
+stage.addEventListener('dblclick', (e) => {
+  const rect = overlay.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * devicePixelRatio;
+  const py = (e.clientY - rect.top) * devicePixelRatio;
+  const id = pickWidget(px, py);
+  if (id == null) return;
+  const w = widgets.find(v => v.id === id);
+  if (!w) return;
+  if (w.kind === 'label' || w.kind === 'note') {
+    const t = prompt('Edit text:', w.text || '');
+    if (t != null) w.text = t;
+  } else if (w.kind === 'sticker') {
+    const t = prompt('Emoji (single character or short text):', w.emoji || '⭐️');
+    if (t != null) w.emoji = t;
   }
 });
 
