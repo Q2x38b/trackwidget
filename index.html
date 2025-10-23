@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Hand Tracker Canvas — Client-Side</title>
 <style>
   :root {
@@ -15,9 +15,9 @@
     --warn: #ff9f0a;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; background: radial-gradient(1200px 800px at 80% -10%, #121521, #0d0f14 45%, #0a0c10 100%); color: var(--text); font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, sans-serif; }
+  html, body { height: 100%; min-height: 100dvh; margin: 0; background: radial-gradient(1200px 800px at 80% -10%, #121521, #0d0f14 45%, #0a0c10 100%); color: var(--text); font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, sans-serif; }
   .app {
-    display: grid; grid-template-rows: auto 1fr auto; gap: 10px; height: 100%; padding: 14px; max-width: 1100px; margin: 0 auto;
+    display: grid; grid-template-rows: auto 1fr auto; gap: 10px; height: 100dvh; padding: 14px; max-width: 100vw; margin: 0 auto;
   }
   header {
     display: flex; gap: 12px; align-items: center; justify-content: space-between;
@@ -40,8 +40,8 @@
   .stage {
     position: relative; border-radius: 16px; overflow: hidden; background: #0b0e15; border: 1px solid #1b2133;
     box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset, 0 24px 70px rgba(0,0,0,0.45);
-    min-height: 420px;
-    aspect-ratio: 16 / 9;
+    min-height: 320px;
+    height: 100%;
     transition: box-shadow 160ms ease, border-color 160ms ease;
   }
   /* Stage glow states */
@@ -51,12 +51,7 @@
                 0 0 16px 2px rgba(90,200,250,0.25);
     border-color: #28486e;
   }
-  .stage.hand-engaged {
-    box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset,
-                0 24px 70px rgba(0,0,0,0.45),
-                0 0 22px 4px rgba(90,200,250,0.4);
-    border-color: #2e6aa5;
-  }
+  /* Removed pinch/engaged glow — border glows only on detection */
   .layer { position: absolute; inset: 0; }
   video { width: 100%; height: 100%; object-fit: cover; filter: saturate(0.95) contrast(1.05) brightness(0.95); transform: scaleX(-1); } /* mirrored for natural UX */
   canvas { width: 100%; height: 100%; display: block; touch-action: none; }
@@ -95,9 +90,6 @@
       <button id="btnStart" class="btn">Enable Camera</button>
       <button id="btnReset" class="btn">Reset Widgets</button>
       <button id="btnSpawn" class="btn">Add Widget</button>
-      <button id="btnAddLabel" class="btn">Add Label</button>
-      <button id="btnAddClock" class="btn">Add Clock</button>
-      <button id="btnAddSticker" class="btn">Add Sticker</button>
       <button id="btnClear" class="btn">Clear Widgets</button>
       <button id="togglePointer" class="toggle" data-on="true" aria-pressed="true">Show Pointer</button>
       <span class="small" style="margin-left:8px;">| Drawing</span>
@@ -113,6 +105,7 @@
   <div class="stage" id="stage">
     <div class="hint">👆 Pinch to grab</div>
     <video id="video" class="layer hidden" playsinline muted></video>
+    <canvas id="webgl" class="layer"></canvas>
     <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
     <canvas id="overlay" class="layer overlay"></canvas>
@@ -157,9 +150,7 @@ const colorPicker = document.getElementById('colorPicker');
 const brushSizeInput = document.getElementById('brushSize');
 const btnClearSketch = document.getElementById('btnClearSketch');
 const btnSave = document.getElementById('btnSave');
-const btnAddLabel = document.getElementById('btnAddLabel');
-const btnAddClock = document.getElementById('btnAddClock');
-const btnAddSticker = document.getElementById('btnAddSticker');
+const webgl = document.getElementById('webgl');
 const stage = document.getElementById('stage');
 
 let showPointer = true;
@@ -188,8 +179,8 @@ const PINCH_OFF = 0.40;
 
 // Widgets state
 /**
- * @typedef {'square'|'circle'|'note'|'label'|'clock'|'sticker'} WidgetKind
- * @typedef {{id:number, x:number, y:number, w:number, h:number, kind:WidgetKind, vx?:number, vy?:number, text?:string, emoji?:string}} Widget
+ * @typedef {'square'|'circle'|'note'} WidgetKind
+ * @typedef {{id:number, x:number, y:number, w:number, h:number, kind:WidgetKind, vx?:number, vy?:number, text?:string}} Widget
  */
 /** @type {Array<Widget>} */
 let widgets = [];
@@ -206,6 +197,10 @@ let brushSize = 8; // CSS px (will be scaled by devicePixelRatio)
 const sketchCtx = () => sketch.getContext('2d');
 let lastDoubleClick = 0;
 
+// Depth-compensated pointer mapping (relative with adaptive gain)
+let prevNormX = null, prevNormY = null;
+const REFERENCE_HAND_SPAN = 0.175; // ~normalized palm width at comfortable distance
+
 // Fit canvases to stage size
 function resizeCanvases() {
   const rect = stage.getBoundingClientRect();
@@ -215,6 +210,9 @@ function resizeCanvases() {
     el.style.width = rect.width + 'px';
     el.style.height = rect.height + 'px';
   }
+  // WebGL canvas size is driven by renderer, but keep CSS size in sync
+  webgl.style.width = rect.width + 'px';
+  webgl.style.height = rect.height + 'px';
 }
 
 // Utility: lerp
@@ -300,12 +298,6 @@ function spawnWidget(kind, x, y) {
     widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0 });
   } else if (kind === 'note') {
     widgets.push({ id: nextId++, x, y, w: baseSize * 1.6, h: baseSize * 1.1, kind, vx: 0, vy: 0, text: 'Note' });
-  } else if (kind === 'label') {
-    widgets.push({ id: nextId++, x, y, w: baseSize * 1.8, h: baseSize * 0.7, kind, vx: 0, vy: 0, text: 'Label' });
-  } else if (kind === 'clock') {
-    widgets.push({ id: nextId++, x, y, w: baseSize * 1.2, h: baseSize * 1.2, kind, vx: 0, vy: 0 });
-  } else if (kind === 'sticker') {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0, emoji: '⭐️' });
   } else {
     widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0 });
   }
@@ -371,7 +363,7 @@ function drawWidgets(ctx) {
     ctx.shadowBlur = 18 * devicePixelRatio;
     ctx.lineWidth = 2 * devicePixelRatio;
 
-    if (w.kind === 'circle' || w.kind === 'clock') {
+    if (w.kind === 'circle') {
       const r = w.w * 0.5;
       const g = (grabbedId === w.id) ? 'rgba(90,200,250,0.9)' : 'rgba(90,200,250,0.35)';
       ctx.beginPath();
@@ -380,10 +372,6 @@ function drawWidgets(ctx) {
       ctx.strokeStyle = g;
       ctx.fill();
       ctx.stroke();
-      // Clock face
-      if (w.kind === 'clock') {
-        drawClock(ctx, w.w);
-      }
     } else {
       const radius = 14 * devicePixelRatio;
       const ww = w.w, hh = w.h;
@@ -403,16 +391,6 @@ function drawWidgets(ctx) {
         ctx.restore();
         // Note text
         drawWidgetText(ctx, w.text || 'Note', ww, hh, { topPadding: 26 * devicePixelRatio });
-      } else if (w.kind === 'label') {
-        drawWidgetText(ctx, w.text || 'Label', ww, hh, { center: true });
-      } else if (w.kind === 'sticker') {
-        // Big emoji centered
-        const fontPx = Math.floor(Math.min(ww, hh) * 0.6);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = `${fontPx}px system-ui, Apple Color Emoji, Segoe UI Emoji`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(w.emoji || '⭐️', 0, 0);
       }
     }
     ctx.restore();
@@ -454,41 +432,7 @@ function drawWidgetText(ctx, text, w, h, opts = {}) {
   ctx.fillText(t, tx, ty);
 }
 
-function drawClock(ctx, size) {
-  const r = size * 0.5;
-  const now = new Date();
-  const sec = now.getSeconds() + now.getMilliseconds()/1000;
-  const min = now.getMinutes() + sec/60;
-  const hr = (now.getHours()%12) + min/60;
-  ctx.save();
-  // ticks
-  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
-  for (let i=0;i<12;i++){
-    const a = (i/12) * Math.PI*2;
-    const inner = r*0.78;
-    const outer = r*0.9;
-    ctx.beginPath();
-    ctx.moveTo(Math.cos(a)*inner, Math.sin(a)*inner);
-    ctx.lineTo(Math.cos(a)*outer, Math.sin(a)*outer);
-    ctx.stroke();
-  }
-  // hands
-  function hand(angle, length, width, color){
-    ctx.save();
-    ctx.rotate(angle);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.beginPath();
-    ctx.moveTo(0,0);
-    ctx.lineTo(length,0);
-    ctx.stroke();
-    ctx.restore();
-  }
-  hand(hr/12 * Math.PI*2, r*0.5, 4*devicePixelRatio, 'rgba(255,255,255,0.9)');
-  hand(min/60 * Math.PI*2, r*0.7, 3*devicePixelRatio, 'rgba(255,255,255,0.85)');
-  hand(sec/60 * Math.PI*2, r*0.8, 2*devicePixelRatio, 'rgba(255,59,48,0.9)');
-  ctx.restore();
-}
+// Clock widget removed
 
 // Draw overlay (landmarks, pointer, pinch)
 function drawOverlay(results) {
@@ -496,7 +440,7 @@ function drawOverlay(results) {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
   // pointer
-  if (pointer.valid) {
+  if (pointer.valid && showPointer) {
     ctx.save();
     const r = 6.5 * devicePixelRatio;
     // glow ring if grabbing or hovering over a widget
@@ -559,10 +503,22 @@ async function frame() {
       tip8 = smoothed[8];
       tip4 = smoothed[4];
 
-      // Update pointer
-      const [px, py] = normToPx(tip8.x, tip8.y);
-      pointer.x = px;
-      pointer.y = py;
+      // Depth-compensated pointer: integrate normalized deltas with adaptive gain
+      const span = Math.hypot(smoothed[5].x - smoothed[17].x, smoothed[5].y - smoothed[17].y);
+      const gain = clamp(REFERENCE_HAND_SPAN / Math.max(0.05, span), 0.6, 3.2);
+      if (prevNormX == null || prevNormY == null) {
+        // Initialize at center for stability on first detection
+        pointer.x = overlay.width * 0.5;
+        pointer.y = overlay.height * 0.5;
+      } else {
+        const dx = tip8.x - prevNormX; // normalized
+        const dy = tip8.y - prevNormY; // normalized
+        const dpx = -dx * overlay.width; // flip X to match mirrored video
+        const dpy = dy * overlay.height;
+        pointer.x = clamp(pointer.x + dpx * gain, 0, overlay.width);
+        pointer.y = clamp(pointer.y + dpy * gain, 0, overlay.height);
+      }
+      prevNormX = tip8.x; prevNormY = tip8.y;
       pointer.valid = true;
       // stage glow: detected when we have landmarks; engaged when pinching or grabbing
       stage.classList.add('hand-detected');
@@ -580,11 +536,7 @@ async function frame() {
       const wasPinching = isPinching;
       isPinching = wasPinching ? (mapped > PINCH_OFF) : (mapped > PINCH_ON);
       pinchStrength = mapped;
-      if (isPinching || grabbedId != null) {
-        stage.classList.add('hand-engaged');
-      } else {
-        stage.classList.remove('hand-engaged');
-      }
+      // Border glow now reflects only detection state, not pinch/engagement
 
       // Interaction: draw or drag
       if (pointer.valid) {
@@ -654,6 +606,7 @@ async function frame() {
       grabbedId = null;
       grabOffsetX = 0; grabOffsetY = 0;
       isDrawing = false;
+      prevNormX = null; prevNormY = null;
     }
   }
 
@@ -662,7 +615,7 @@ async function frame() {
     const octx = overlay.getContext('2d');
     octx.clearRect(0, 0, overlay.width, overlay.height);
     stage.classList.remove('hand-detected');
-    stage.classList.remove('hand-engaged');
+    // No engaged state — only detection controls border glow
   }
 
   // Update physics for tossed widgets
@@ -672,6 +625,12 @@ async function frame() {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawWidgets(ctx);
+
+  // Update 3D rotation and render scene
+  update3DRotation();
+  if (renderer && scene && camera) {
+    renderer.render(scene, camera);
+  }
 
   requestAnimationFrame(frame);
 }
@@ -796,18 +755,7 @@ btnSpawn.addEventListener('click', () => {
 });
 btnClear.addEventListener('click', () => clearWidgets());
 
-btnAddLabel.addEventListener('click', () => {
-  const x = overlay.width * 0.5, y = overlay.height * 0.35;
-  spawnWidget('label', x, y);
-});
-btnAddClock.addEventListener('click', () => {
-  const x = overlay.width * 0.6, y = overlay.height * 0.5;
-  spawnWidget('clock', x, y);
-});
-btnAddSticker.addEventListener('click', () => {
-  const x = overlay.width * 0.4, y = overlay.height * 0.55;
-  spawnWidget('sticker', x, y);
-});
+// Removed label/clock/sticker widget controls
 
 togglePointer.addEventListener('click', () => {
   showPointer = !showPointer;
@@ -927,7 +875,7 @@ window.addEventListener('pointerup', () => {
   }
 });
 
-// Double-click to edit text on label/note/sticker
+// Double-click to edit text on note
 stage.addEventListener('dblclick', (e) => {
   const rect = overlay.getBoundingClientRect();
   const px = (e.clientX - rect.left) * devicePixelRatio;
@@ -936,22 +884,107 @@ stage.addEventListener('dblclick', (e) => {
   if (id == null) return;
   const w = widgets.find(v => v.id === id);
   if (!w) return;
-  if (w.kind === 'label' || w.kind === 'note') {
+  if (w.kind === 'note') {
     const t = prompt('Edit text:', w.text || '');
     if (t != null) w.text = t;
-  } else if (w.kind === 'sticker') {
-    const t = prompt('Emoji (single character or short text):', w.emoji || '⭐️');
-    if (t != null) w.emoji = t;
   }
 });
 
 // Init sizing & default widgets
 window.addEventListener('resize', () => { resizeCanvases(); });
 resizeCanvases();
+// Observe stage size changes to keep canvases perfectly fitted
+new ResizeObserver(() => { resizeCanvases(); resizeThree(); }).observe(stage);
 resetWidgets();
 statusEl.textContent = 'Ready. Click “Enable Camera” to start.';
 // Start animation loop immediately so widgets render even before camera/model
 requestAnimationFrame(frame);
+
+// --- 3D Viewer (Three.js) ---
+let three = null;
+let scene = null, camera = null, renderer = null, modelRoot = null;
+let targetRotX = 0, targetRotY = 0, rotX = 0, rotY = 0;
+
+async function initThree() {
+  try {
+    const THREE_VERSION = '0.160.0';
+    const THREE_URL = `https://esm.sh/three@${THREE_VERSION}`;
+    const GLTF_URL = `https://esm.sh/three@${THREE_VERSION}/examples/jsm/loaders/GLTFLoader.js`;
+    three = await withTimeout(import(THREE_URL), 20000, 'Load three.js');
+    const gltfMod = await withTimeout(import(GLTF_URL), 20000, 'Load GLTFLoader');
+    const { Scene, PerspectiveCamera, WebGLRenderer, Color, AmbientLight, DirectionalLight, TorusKnotGeometry, MeshStandardMaterial, Mesh } = three;
+    const { GLTFLoader } = gltfMod;
+
+    scene = new Scene();
+    scene.background = null;
+    camera = new PerspectiveCamera(45, 16/9, 0.01, 100);
+    camera.position.set(0, 0, 3);
+
+    renderer = new WebGLRenderer({ canvas: webgl, antialias: true, alpha: true });
+    if (renderer.setPixelRatio) renderer.setPixelRatio(devicePixelRatio);
+    // Color space compatibility across versions
+    if (renderer.outputColorSpace !== undefined) {
+      renderer.outputColorSpace = three.SRGBColorSpace || renderer.outputColorSpace;
+    } else if (renderer.outputEncoding !== undefined) {
+      renderer.outputEncoding = three.sRGBEncoding;
+    }
+    resizeThree();
+
+    const amb = new AmbientLight(0xffffff, 0.6);
+    scene.add(amb);
+    const dir = new DirectionalLight(0xffffff, 1.0);
+    dir.position.set(2, 3, 4);
+    scene.add(dir);
+
+    modelRoot = new three.Group();
+    scene.add(modelRoot);
+
+    // Try loading a glTF model; fall back to a TorusKnot if it fails
+    const loader = new GLTFLoader();
+    const MODEL_URL = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF/DamagedHelmet.gltf';
+    try {
+      const gltf = await withTimeout(loader.loadAsync(MODEL_URL), 25000, 'Load glTF model');
+      const obj = gltf.scene;
+      obj.scale.set(1.6, 1.6, 1.6);
+      obj.rotation.set(0, Math.PI, 0);
+      modelRoot.add(obj);
+    } catch (err) {
+      const geo = new TorusKnotGeometry(0.7, 0.25, 160, 32);
+      const mat = new MeshStandardMaterial({ color: 0x5ac8fa, roughness: 0.35, metalness: 0.2 });
+      const mesh = new Mesh(geo, mat);
+      modelRoot.add(mesh);
+    }
+  } catch (err) {
+    console.warn('Three.js init failed:', err);
+  }
+}
+
+function resizeThree() {
+  if (!renderer || !camera) return;
+  const rect = stage.getBoundingClientRect();
+  const w = Math.floor(rect.width * devicePixelRatio);
+  const h = Math.floor(rect.height * devicePixelRatio);
+  renderer.setSize(w, h, false);
+  camera.aspect = rect.width / rect.height;
+  camera.updateProjectionMatrix();
+}
+
+// Update 3D model rotation target from pointer position
+function update3DRotation() {
+  if (!modelRoot || !overlay.width || !overlay.height) return;
+  if (pointer.valid) {
+    const nx = pointer.x / overlay.width;   // 0..1
+    const ny = pointer.y / overlay.height;  // 0..1
+    targetRotY = (nx - 0.5) * 1.8;
+    targetRotX = (0.5 - ny) * 1.2;
+  }
+  rotX = lerp(rotX, targetRotX, 0.08);
+  rotY = lerp(rotY, targetRotY, 0.08);
+  modelRoot.rotation.set(rotX, rotY, 0);
+}
+
+// Kick off 3D once DOM is ready
+initThree();
 
 </script>
 </body>
