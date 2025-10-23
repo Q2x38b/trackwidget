@@ -131,11 +131,14 @@
         size
         <input id="pointerSize" type="range" min="4" max="20" step="1" value="7" />
       </label>
+
+      <span class="small" style="margin-left:8px;">| Resize</span>
+      <button id="toggleSecondHand" class="toggle" data-on="true" aria-pressed="true" title="Allow second hand for resizing">2nd-hand Resize</button>
     </div>
   </header>
 
   <div class="stage" id="stage">
-    <div class="hint">🤏 Grab with one hand; pinch other to resize</div>
+    <div class="hint">🤏 Grab with one hand; move other hand up/down to resize</div>
     <video id="video" class="layer hidden" playsinline muted></video>
     <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
@@ -185,12 +188,14 @@ const smoothingCutoffInput = document.getElementById('smoothingCutoff');
 const smoothingBetaInput = document.getElementById('smoothingBeta');
 const pointerSizeInput = document.getElementById('pointerSize');
 const stage = document.getElementById('stage');
+const toggleSecondHand = document.getElementById('toggleSecondHand');
 
 let showPointer = true;
 let handLandmarker = null;
 let cameraStream = null;
 let running = false;
 let lastVideoTime = -1;
+let allowSecondHand = true;
 
 // Pointer + landmark smoothing (One Euro filter) — multi-hand
 const MAX_HANDS = 2;
@@ -227,8 +232,9 @@ let grabbedId = null;
 let grabHand = null;        // 0 or 1
 // Resize with the other hand's pinch-open distance
 let resizeHand = null;      // 0 or 1 (the non-grabbing hand)
-let resizeBaseDist = 0;     // normalized distance at start of resize
+let resizeBaseDist = 0;     // normalized distance at start of resize (legacy)
 let resizeBaseW = 0, resizeBaseH = 0; // widget size at start of resize
+let resizeStartY = 0;       // vertical baseline for up/down resize
 let nextId = 1;
 
 // Drawing state
@@ -475,16 +481,26 @@ function drawWidgetText(ctx, text, w, h, opts = {}) {
 
 // Clock widget removed
 
+// Determine which single hand is "primary" when second-hand is disabled
+function primaryHandIndex() {
+  if (grabHand != null) return grabHand;
+  if (hands[0] && hands[0].valid) return 0;
+  if (hands[1] && hands[1].valid) return 1;
+  return null;
+}
+
 // Draw overlay (landmarks, pointer, pinch)
 function drawOverlay() {
   const ctx = overlay.getContext('2d');
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
   if (!showPointer) return;
-
+  const primary = primaryHandIndex();
   for (let i = 0; i < MAX_HANDS; i++) {
     const h = hands[i];
     if (!h.valid) continue;
+    // If second-hand usage is disabled, render only the primary hand pointer
+    if (!allowSecondHand && i !== primary) continue;
     ctx.save();
     const r = pointerRadius * devicePixelRatio;
     const hoveringId = pickWidget(h.x, h.y);
@@ -623,12 +639,14 @@ async function frame() {
             }
           }
         } else {
-          // Grab with one hand; resize with the other
+          // Grab with one hand; resize with the other (if enabled)
           if (grabbedId == null) {
-            // Look for a pinch start over a widget on any hand
-            for (let i = 0; i < MAX_HANDS; i++) {
+            // Look for a pinch start over a widget on allowed hand(s)
+            const primary = primaryHandIndex();
+            const candidates = allowSecondHand ? [0, 1] : (primary != null ? [primary] : []);
+            for (const i of candidates) {
               const h = hands[i];
-              if (!h.valid) continue;
+              if (!h || !h.valid) continue;
               if (h.isPinching && !h.wasPinching) {
                 const hit = pickWidget(h.x, h.y);
                 if (hit != null) {
@@ -664,23 +682,24 @@ async function frame() {
                 resizeHand = null;
               }
 
-              // Resize with the other hand's pinch distance
+              // Resize with the other hand — vertical movement up/down
               if (grabbedId != null) {
                 const other = grabHand === 0 ? 1 : 0;
                 const oh = hands[other];
                 if (oh && oh.valid) {
                   const minSize = 40 * devicePixelRatio;
                   const maxSize = Math.min(overlay.width, overlay.height) * 0.8;
-                  if (oh.isPinching) {
+                  if (allowSecondHand && other !== grabHand && oh.isPinching) {
                     if (resizeHand == null) {
                       // Begin resize
                       resizeHand = other;
-                      resizeBaseDist = Math.max(oh.rawPinchDist, 0.001);
+                      resizeStartY = oh.y;
                       resizeBaseW = w.w;
                       resizeBaseH = w.h;
                     }
                     if (resizeHand === other) {
-                      const scale = clamp(oh.rawPinchDist / resizeBaseDist, 0.5, 3.0);
+                      const dy = (resizeStartY - oh.y) / (overlay.height); // up is negative y in pixels? Our coords increase downward, so up -> smaller y -> positive (startY - y)
+                      const scale = clamp(1 + dy * 2.0, 0.4, 3.0); // sensitivity 2.0x screen height
                       w.w = clamp(resizeBaseW * scale, minSize, maxSize);
                       // keep aspect ratio for each widget
                       const aspect = resizeBaseH / Math.max(1, resizeBaseW);
@@ -705,7 +724,7 @@ async function frame() {
         statusEl.textContent = 'Resizing';
       } else if (grabbedId != null) {
         statusEl.textContent = 'Grabbing';
-      } else if (hands.some(h => h.isPinching)) {
+      } else if (hands.some((h, idx) => h.isPinching && (allowSecondHand || idx === primaryHandIndex()))) {
         statusEl.textContent = 'Pinching';
       } else {
         statusEl.textContent = 'Hand detected.';
@@ -966,6 +985,19 @@ btnSave.addEventListener('click', () => {
   a.download = 'hand-canvas.png';
   a.click();
 });
+
+// Toggle: allow/disallow second-hand resizing
+if (toggleSecondHand) {
+  toggleSecondHand.addEventListener('click', () => {
+    allowSecondHand = !allowSecondHand;
+    toggleSecondHand.dataset.on = String(allowSecondHand);
+    toggleSecondHand.setAttribute('aria-pressed', String(allowSecondHand));
+    // Immediately cancel any active resize if disabling
+    if (!allowSecondHand) {
+      resizeHand = null;
+    }
+  });
+}
 
 // Touch/mouse fallback (supports widgets drag or drawing)
 let pointerDown = false;
