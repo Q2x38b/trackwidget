@@ -457,7 +457,7 @@ async function initHandLandmarker() {
   }
   if (!visionModule) throw lastErr || new Error('Failed to load tasks-vision module');
 
-  const { FilesetResolver, HandLandmarker, VisionRunningMode } = visionModule;
+  const { FilesetResolver, HandLandmarker } = visionModule;
 
   // Resolve WASM files (try multiple CDNs)
   const WASM_ROOTS = [
@@ -488,7 +488,7 @@ async function initHandLandmarker() {
       baseOptions: {
         modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
       },
-      runningMode: VisionRunningMode.VIDEO,
+      runningMode: 'VIDEO',
       numHands: 1,
       minHandDetectionConfidence: 0.6,
       minHandPresenceConfidence: 0.6,
