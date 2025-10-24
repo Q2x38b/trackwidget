@@ -108,6 +108,11 @@
       <button id="btnReset" class="btn">Reset Widgets</button>
       <button id="btnSpawn" class="btn">Add Widget</button>
       <button id="btnClear" class="btn">Clear Widgets</button>
+
+      <span class="small" style="margin-left:8px;">| 3D</span>
+      <button id="btnAddCube" class="btn">Add Cube</button>
+      <button id="btnAddSphere" class="btn">Add Sphere</button>
+      <button id="toggleRotate3D" class="toggle" data-on="true" aria-pressed="true" title="When on, hand only rotates 3D objects (no 2D rotation)">3D Rotate-only</button>
       <button id="togglePointer" class="toggle" data-on="true" aria-pressed="true">Show Pointer</button>
       <span class="small" style="margin-left:8px;">| Drawing</span>
       <button id="btnDrawMode" class="toggle" data-on="false" aria-pressed="false">Draw Mode</button>
@@ -140,6 +145,7 @@
   <div class="stage" id="stage">
     <div class="hint">🤏 Grab with one hand; twist wrist to rotate; move other hand up/down to resize</div>
     <video id="video" class="layer hidden" playsinline muted></video>
+    <canvas id="webgl" class="layer"></canvas>
     <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
     <canvas id="overlay" class="layer overlay"></canvas>
@@ -170,6 +176,7 @@
 
 const statusEl = document.getElementById('status');
 const video = document.getElementById('video');
+const webgl = document.getElementById('webgl');      // 3D layer
 const sketch = document.getElementById('sketch');     // persistent drawing layer
 const canvas = document.getElementById('canvas');     // interaction layer (widgets)
 const overlay = document.getElementById('overlay');   // pointer & debug
@@ -177,7 +184,10 @@ const btnStart = document.getElementById('btnStart');
 const btnReset = document.getElementById('btnReset');
 const btnSpawn = document.getElementById('btnSpawn');
 const btnClear = document.getElementById('btnClear');
+const btnAddCube = document.getElementById('btnAddCube');
+const btnAddSphere = document.getElementById('btnAddSphere');
 const togglePointer = document.getElementById('togglePointer');
+const toggleRotate3D = document.getElementById('toggleRotate3D');
 const btnDrawMode = document.getElementById('btnDrawMode');
 const btnEraser = document.getElementById('btnEraser');
 const colorPicker = document.getElementById('colorPicker');
@@ -196,6 +206,18 @@ let cameraStream = null;
 let running = false;
 let lastVideoTime = -1;
 let allowSecondHand = true;
+let rotate3DOnly = true; // when true, wrist twist rotates only 3D objects (2D widgets won't rotate)
+
+// Three.js state
+let THREE_NS = null; // assigned after dynamic import
+const three = {
+  scene: null,
+  camera: null,
+  renderer: null,
+  raycaster: null,
+  objects: [], // interactive meshes
+  hovered: null,
+};
 
 // Pointer + landmark smoothing (One Euro filter) — multi-hand
 const MAX_HANDS = 2;
@@ -203,7 +225,8 @@ const MAX_HANDS = 2;
  *  x:number,y:number,valid:boolean,
  *  lmFilters:null|Array<{fx:OneEuro1D,fy:OneEuro1D}>,
  *  isPinching:boolean,wasPinching:boolean,pinchStrength:number,rawPinchDist:number,
- *  prevRawX?:number, prevRawY?:number, gain?:number, angle?:number
+ *  prevRawX?:number, prevRawY?:number, gain?:number, angle?:number,
+ *  world?: Array<{x:number,y:number,z:number}>|null, quat?: any
  * }} HandState */
 /** @type {Array<HandState>} */
 let hands = Array.from({ length: MAX_HANDS }, () => ({
@@ -261,11 +284,18 @@ let pointerRadius = 7; // CSS px
 // Fit canvases to stage size
 function resizeCanvases() {
   const rect = stage.getBoundingClientRect();
-  for (const el of [sketch, canvas, overlay]) {
+  for (const el of [webgl, sketch, canvas, overlay]) {
     el.width = Math.floor(rect.width * devicePixelRatio);
     el.height = Math.floor(rect.height * devicePixelRatio);
     el.style.width = rect.width + 'px';
     el.style.height = rect.height + 'px';
+  }
+  // Update 3D renderer size and camera aspect
+  if (three.renderer && three.camera) {
+    three.renderer.setPixelRatio(devicePixelRatio);
+    three.renderer.setSize(rect.width, rect.height, false);
+    three.camera.aspect = rect.width / rect.height;
+    three.camera.updateProjectionMatrix();
   }
 }
 
@@ -377,16 +407,23 @@ function clearWidgets() {
   widgets = [];
 }
 
-const HIT_EXPAND = 36 * devicePixelRatio; // larger hit targets for easier grabs
+const HIT_EXPAND = 36 * devicePixelRatio; // base hit target expansion
 let grabOffsetX = 0, grabOffsetY = 0;    // preserve offset when grabbing
 
-function pickWidget(px, py) {
+function dynamicHitExpand(hand) {
+  const s = clamp(hand?.pinchStrength ?? 0, 0, 1);
+  // Expand with pinch strength and pointer size, making grabs easier when pinching
+  const extra = (8 + pointerRadius) * devicePixelRatio * (0.35 + 0.5 * s);
+  return HIT_EXPAND + extra;
+}
+
+function pickWidget(px, py, expand = HIT_EXPAND) {
   // topmost first — iterate from end
   for (let i = widgets.length - 1; i >= 0; i--) {
     const w = widgets[i];
     if (w.kind === 'circle') {
       const dx = px - w.x, dy = py - w.y;
-      if (Math.hypot(dx, dy) <= w.w * 0.5 + HIT_EXPAND) return w.id;
+      if (Math.hypot(dx, dy) <= w.w * 0.5 + expand) return w.id;
     } else {
       // square or note are rectangles — account for rotation
       const rot = w.rot || 0;
@@ -395,10 +432,10 @@ function pickWidget(px, py) {
       const lx = dx * cos - dy * sin; // rotate point into widget-local frame
       const ly = dx * sin + dy * cos;
       if (
-        lx >= -w.w/2 - HIT_EXPAND &&
-        lx <=  w.w/2 + HIT_EXPAND &&
-        ly >= -w.h/2 - HIT_EXPAND &&
-        ly <=  w.h/2 + HIT_EXPAND
+        lx >= -w.w/2 - expand &&
+        lx <=  w.w/2 + expand &&
+        ly >= -w.h/2 - expand &&
+        ly <=  w.h/2 + expand
       ) return w.id;
     }
   }
@@ -522,7 +559,7 @@ function drawOverlay() {
     if (!allowSecondHand && i !== primary) continue;
     ctx.save();
     const r = pointerRadius * devicePixelRatio;
-    const hoveringId = pickWidget(h.x, h.y);
+    const hoveringId = pickWidget(h.x, h.y); // default hover expansion
     const isGrabbingHand = grabHand === i && grabbedId != null;
     const engaging = isGrabbingHand || hoveringId != null || h.isPinching;
     if (engaging) {
@@ -590,6 +627,8 @@ async function frame() {
         const mcp17 = smoothed[17];
         const palmWidth = Math.hypot(mcp5.x - mcp17.x, mcp5.y - mcp17.y) || 0.001;
         h.angle = Math.atan2(mcp17.y - mcp5.y, mcp17.x - mcp5.x);
+        // Store world landmarks if available for 3D orientation
+        h.world = results.worldLandmarks?.[i] || null;
         // Depth-invariant pointer gain using palm size
         if (h.prevRawX == null || h.prevRawY == null) {
           h.prevRawX = rawPx; h.prevRawY = rawPy;
@@ -632,6 +671,9 @@ async function frame() {
         }
         h.pinchStrength = mapped;
         h.rawPinchDist = dist;
+
+        // Estimate a palm orientation quaternion for 3D mapping
+        h.quat = computePalmQuaternion(h.world, smoothed, h.quat);
       }
 
       // Interaction
@@ -674,8 +716,11 @@ async function frame() {
             }
           }
         } else {
-          // Grab with one hand; resize with the other (if enabled)
-          if (grabbedId == null) {
+          // 3D interactions first, then 2D widgets if no 3D grab
+          handleThreeInteractions(results);
+
+          // If no 3D object is grabbed, enable 2D widgets: grab with one hand; resize with the other (if enabled)
+          if (!threeState.grabbed && grabbedId == null) {
             // Look for any active pinch over a widget on allowed hand(s)
             const primary = primaryHandIndex();
             const candidates = allowSecondHand ? [0, 1] : (primary != null ? [primary] : []);
@@ -683,7 +728,7 @@ async function frame() {
               const h = hands[i];
               if (!h || !h.valid) continue;
               if (h.isPinching) {
-                const hit = pickWidget(h.x, h.y);
+                const hit = pickWidget(h.x, h.y, dynamicHitExpand(h));
                 if (hit != null) {
                   const w = widgets.find(v => v.id === hit);
                   if (w) {
@@ -702,7 +747,7 @@ async function frame() {
             }
           }
 
-          if (grabbedId != null && grabHand != null) {
+          if (grabbedId != null && grabHand != null && !threeState.grabbed) {
             const gh = hands[grabHand];
             const w = widgets.find(v => v.id === grabbedId);
             if (!w) {
@@ -711,11 +756,13 @@ async function frame() {
               // Move while grab hand keeps pinching
               if (gh.isPinching) {
                 moveWidget(grabbedId, gh.x + grabOffsetX, gh.y + grabOffsetY);
-                // Rotate with wrist twist while grabbing
-                const curAngle = gh.angle || 0;
-                const delta = wrapAngle(curAngle - grabStartAngle);
-                const ROT_GAIN = 1.0;
-                w.rot = wrapAngle((grabStartRot || 0) + delta * ROT_GAIN);
+                // Rotate with wrist twist while grabbing (disabled when rotate3DOnly is true)
+                if (!rotate3DOnly) {
+                  const curAngle = gh.angle || 0;
+                  const delta = wrapAngle(curAngle - grabStartAngle);
+                  const ROT_GAIN = 1.0;
+                  w.rot = wrapAngle((grabStartRot || 0) + delta * ROT_GAIN);
+                }
               } else {
                 // Release
                 const releasedId = grabbedId;
@@ -763,7 +810,9 @@ async function frame() {
 
       // Overlay + status
       drawOverlay();
-      if (grabbedId != null && resizeHand != null) {
+      if (threeState.grabbed) {
+        statusEl.textContent = rotate3DOnly ? 'Rotating 3D' : 'Manipulating 3D';
+      } else if (grabbedId != null && resizeHand != null) {
         statusEl.textContent = 'Resizing';
       } else if (grabbedId != null) {
         statusEl.textContent = 'Grabbing';
@@ -810,7 +859,8 @@ async function frame() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawWidgets(ctx);
 
-  // 3D rendering removed
+  // 3D rendering
+  renderThree();
 
   requestAnimationFrame(frame);
 }
@@ -935,6 +985,15 @@ btnSpawn.addEventListener('click', () => {
 });
 btnClear.addEventListener('click', () => clearWidgets());
 
+// 3D controls
+if (btnAddCube) btnAddCube.addEventListener('click', () => spawn3D('cube'));
+if (btnAddSphere) btnAddSphere.addEventListener('click', () => spawn3D('sphere'));
+if (toggleRotate3D) toggleRotate3D.addEventListener('click', () => {
+  rotate3DOnly = !rotate3DOnly;
+  toggleRotate3D.dataset.on = String(rotate3DOnly);
+  toggleRotate3D.setAttribute('aria-pressed', String(rotate3DOnly));
+});
+
 // Removed label/clock/sticker widget controls
 
 togglePointer.addEventListener('click', () => {
@@ -1021,6 +1080,8 @@ btnSave.addEventListener('click', () => {
   // Optional background fill
   octx.fillStyle = '#0b0e15';
   octx.fillRect(0, 0, out.width, out.height);
+  // 3D layer (webgl) — draw first
+  try { octx.drawImage(webgl, 0, 0, out.width, out.height); } catch(e) {}
   // Drawing layer
   octx.drawImage(sketch, 0, 0);
   // Widgets
@@ -1054,12 +1115,19 @@ stage.addEventListener('pointerdown', (e) => {
   if (drawMode) {
     isDrawing = true; pointerDown = true; lastDrawX = px; lastDrawY = py;
   } else {
-    const hit = pickWidget(px, py);
-    if (hit != null) {
-      grabbedId = hit;
-      const w = widgets.find(v => v.id === hit);
-      if (w) { grabOffsetX = w.x - px; grabOffsetY = w.y - py; w.vx = 0; w.vy = 0; }
+    // Try 3D pick first on mouse/touch
+    const threeHit = raycast3DFromPixels(px, py);
+    if (threeHit) {
+      beginThreeGrab(null, threeHit, { px, py });
       pointerDown = true;
+    } else {
+      const hit = pickWidget(px, py);
+      if (hit != null) {
+        grabbedId = hit;
+        const w = widgets.find(v => v.id === hit);
+        if (w) { grabOffsetX = w.x - px; grabOffsetY = w.y - py; w.vx = 0; w.vy = 0; }
+        pointerDown = true;
+      }
     }
   }
 });
@@ -1087,6 +1155,9 @@ window.addEventListener('pointermove', (e) => {
     ctxS.stroke();
     ctxS.restore();
     lastDrawX = px; lastDrawY = py;
+  } else if (threeState.grabbed && !rotate3DOnly) {
+    // Mouse/touch drag move for 3D when allowed
+    updateThreeDragFromPixels(px, py);
   } else if (grabbedId != null) {
     moveWidget(grabbedId, px + grabOffsetX, py + grabOffsetY);
   }
@@ -1095,6 +1166,7 @@ window.addEventListener('pointerup', () => {
   if (drawMode) {
     isDrawing = false; pointerDown = false;
   } else {
+    if (threeState.grabbed) endThreeGrab();
     const releasedId = grabbedId;
     pointerDown = false; grabbedId = null; grabOffsetX = 0; grabOffsetY = 0;
     const w = widgets.find(v => v.id === releasedId);
@@ -1119,6 +1191,10 @@ stage.addEventListener('dblclick', (e) => {
 
 // Init sizing & default widgets
 window.addEventListener('resize', () => { resizeCanvases(); });
+
+// Load three.js, init 3D, then size canvases and start
+await loadThree();
+initThree();
 resizeCanvases();
 // Observe stage size changes to keep canvases perfectly fitted
 new ResizeObserver(() => { resizeCanvases(); }).observe(stage);
@@ -1126,7 +1202,6 @@ resetWidgets();
 statusEl.textContent = 'Ready. Click “Enable Camera” to start.';
 // Start animation loop immediately so widgets render even before camera/model
 requestAnimationFrame(frame);
-// 3D viewer removed
 
 </script>
 </body>
