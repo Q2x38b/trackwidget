@@ -230,67 +230,123 @@ const threeState = {
   baseObjEulerZ: 0,     // object euler z at grab start (fallback)
 };
 
-// Compute a palm orientation quaternion (stubbed to identity unless world landmarks exist)
+// --- 3D math helpers for stable palm orientation ---
+function sub3(a, b) { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+function dot3(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+function cross3(a, b) {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  };
+}
+function norm3(v) {
+  const m = Math.hypot(v.x, v.y, v.z) || 1;
+  return { x: v.x / m, y: v.y / m, z: v.z / m };
+}
+function quatFromBasis(x, y, z) {
+  const m00 = x.x, m01 = y.x, m02 = z.x;
+  const m10 = x.y, m11 = y.y, m12 = z.y;
+  const m20 = x.z, m21 = y.z, m22 = z.z;
+  const t = m00 + m11 + m22;
+  let qw, qx, qy, qz;
+  if (t > 0) {
+    const s = Math.sqrt(t + 1.0) * 2;
+    qw = 0.25 * s;
+    qx = (m21 - m12) / s;
+    qy = (m02 - m20) / s;
+    qz = (m10 - m01) / s;
+  } else if (m00 > m11 && m00 > m22) {
+    const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2;
+    qw = (m21 - m12) / s;
+    qx = 0.25 * s;
+    qy = (m01 + m10) / s;
+    qz = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2;
+    qw = (m02 - m20) / s;
+    qx = (m01 + m10) / s;
+    qy = 0.25 * s;
+    qz = (m12 + m21) / s;
+  } else {
+    const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2;
+    qw = (m10 - m01) / s;
+    qx = (m02 + m20) / s;
+    qy = (m12 + m21) / s;
+    qz = 0.25 * s;
+  }
+  return { x: qx, y: qy, z: qz, w: qw };
+}
+function normalizeQuat(q) {
+  const m = Math.hypot(q.x, q.y, q.z, q.w) || 1;
+  return { x: q.x / m, y: q.y / m, z: q.z / m, w: q.w / m };
+}
+function slerpQuat(a, b, t) {
+  // Ensure shortest path
+  let dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+  let bx = b.x, by = b.y, bz = b.z, bw = b.w;
+  if (dot < 0) { dot = -dot; bx = -bx; by = -by; bz = -bz; bw = -bw; }
+  if (dot > 0.9995) {
+    // Nearly linear
+    const out = {
+      x: a.x + t * (bx - a.x), y: a.y + t * (by - a.y), z: a.z + t * (bz - a.z), w: a.w + t * (bw - a.w)
+    };
+    return normalizeQuat(out);
+  }
+  const theta0 = Math.acos(clamp(dot, -1, 1));
+  const theta = theta0 * t;
+  const sinTheta = Math.sin(theta);
+  const sinTheta0 = Math.sin(theta0);
+  const s0 = Math.cos(theta) - dot * sinTheta / sinTheta0;
+  const s1 = sinTheta / sinTheta0;
+  return normalizeQuat({
+    x: (s0 * a.x) + (s1 * bx),
+    y: (s0 * a.y) + (s1 * by),
+    z: (s0 * a.z) + (s1 * bz),
+    w: (s0 * a.w) + (s1 * bw),
+  });
+}
+
+// Compute a stable palm orientation quaternion using multiple MCP/tip points
 function computePalmQuaternion(worldLandmarks, smoothed2D, prevQuat) {
-  // If world landmarks are available, estimate a stable orientation from wrist (0), index MCP (5), pinky MCP (17)
   try {
     if (worldLandmarks && worldLandmarks.length >= 18) {
-      const wrist = worldLandmarks[0];
-      const indexMcp = worldLandmarks[5];
-      const pinkyMcp = worldLandmarks[17];
-      // Build tangent axes in camera space
-      const vx = { x: indexMcp.x - wrist.x, y: indexMcp.y - wrist.y, z: indexMcp.z - wrist.z };
-      const vy = { x: pinkyMcp.x - wrist.x, y: pinkyMcp.y - wrist.y, z: pinkyMcp.z - wrist.z };
-      // Normal via cross product
-      const nz = {
-        x: vx.y * vy.z - vx.z * vy.y,
-        y: vx.z * vy.x - vx.x * vy.z,
-        z: vx.x * vy.y - vx.y * vy.x,
-      };
-      // Normalize vectors
-      const norm = (v) => { const m = Math.hypot(v.x, v.y, v.z) || 1; return { x: v.x / m, y: v.y / m, z: v.z / m }; };
-      const z = norm(nz);
-      const x = norm(vx);
-      // Orthonormal y = z × x
-      const y = norm({ x: z.y * x.z - z.z * x.y, y: z.z * x.x - z.x * x.z, z: z.x * x.y - z.y * x.x });
-      // Rotation matrix columns (x, y, z)
-      const m00 = x.x, m01 = y.x, m02 = z.x;
-      const m10 = x.y, m11 = y.y, m12 = z.y;
-      const m20 = x.z, m21 = y.z, m22 = z.z;
-      // Convert to quaternion (right-handed)
-      const t = m00 + m11 + m22;
-      let qw, qx, qy, qz;
-      if (t > 0) {
-        const s = Math.sqrt(t + 1.0) * 2; // s = 4*qw
-        qw = 0.25 * s;
-        qx = (m21 - m12) / s;
-        qy = (m02 - m20) / s;
-        qz = (m10 - m01) / s;
-      } else if (m00 > m11 && m00 > m22) {
-        const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2; // s = 4*qx
-        qw = (m21 - m12) / s;
-        qx = 0.25 * s;
-        qy = (m01 + m10) / s;
-        qz = (m02 + m20) / s;
-      } else if (m11 > m22) {
-        const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2; // s = 4*qy
-        qw = (m02 - m20) / s;
-        qx = (m01 + m10) / s;
-        qy = 0.25 * s;
-        qz = (m12 + m21) / s;
-      } else {
-        const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2; // s = 4*qz
-        qw = (m10 - m01) / s;
-        qx = (m02 + m20) / s;
-        qy = (m12 + m21) / s;
-        qz = 0.25 * s;
+      const w = worldLandmarks;
+      const wrist = w[0];
+      const indexMcp = w[5];
+      const pinkyMcp = w[17];
+      const middleMcp = w[9];
+      const middleTip = w[12];
+
+      // Primary axis across the knuckles (pinky->index)
+      const xAxis = norm3(sub3(indexMcp, pinkyMcp));
+      // Forward axis approximated by middle finger direction; fallback to wrist->middle
+      let vFwd = norm3(sub3(middleTip, middleMcp));
+      if (!Number.isFinite(vFwd.x) || !Number.isFinite(vFwd.y) || !Number.isFinite(vFwd.z)) {
+        vFwd = norm3(sub3(middleMcp, wrist));
       }
-      return { x: qx, y: qy, z: qz, w: qw };
+      // Palm normal via cross; enforce right-handed basis
+      let zAxis = norm3(cross3(xAxis, vFwd));
+      // If degenerate, fallback using wrist->index
+      if (!Number.isFinite(zAxis.x) || !Number.isFinite(zAxis.y) || !Number.isFinite(zAxis.z)) {
+        const alt = norm3(sub3(indexMcp, wrist));
+        zAxis = norm3(cross3(xAxis, alt));
+      }
+      let yAxis = norm3(cross3(zAxis, xAxis));
+
+      // Compose quaternion from basis
+      let qNow = quatFromBasis(xAxis, yAxis, zAxis);
+      qNow = normalizeQuat(qNow);
+
+      // Smooth orientation to reduce jitter
+      if (prevQuat) {
+        qNow = slerpQuat(prevQuat, qNow, PALM_SLERP_ALPHA);
+      }
+      return qNow;
     }
   } catch (_) {
     // fall through to identity
   }
-  // Identity quaternion as safe default
   return prevQuat || { x: 0, y: 0, z: 0, w: 1 };
 }
 
@@ -491,6 +547,11 @@ const PINCH_OFF_FRAMES = 2; // consecutive frames required to end pinch
 // Reference ratio for 3D pinch metric: when index-thumb distance equals
 // PINCH_REF_RATIO3D * palmWidth3D, pinchStrength≈0. Higher makes pinch easier to trigger.
 const PINCH_REF_RATIO3D = 0.82;
+// Multi-cue pinch scoring weights (proximity vs. finger alignment)
+const PINCH_PROX_WEIGHT = 0.65;
+const PINCH_ALIGN_WEIGHT = 0.35;
+// Palm quaternion temporal smoothing for stable 3D rotation
+const PALM_SLERP_ALPHA = 0.25;
 
 // Widgets state
 /**
@@ -890,8 +951,8 @@ async function frame() {
         }
         h.valid = true;
 
-        // Orientation-invariant pinch metric
-        // Prefer 3D world landmark distances normalized by 3D palm width; fallback to 2D
+        // Orientation-invariant pinch metric with multi-cue scoring
+        // Prefer 3D world landmark distances + alignment; fallback to 2D distance
         const dist2D = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized image-space
         let pinchInput = 0;
         if (h.world && h.world.length >= 18) {
@@ -900,9 +961,21 @@ async function frame() {
           const dist3D = Math.hypot(dx, dy, dz);
           const pwx = w5.x - w17w.x, pwy = w5.y - w17w.y, pwz = w5.z - w17w.z;
           const palmWidth3D = Math.hypot(pwx, pwy, pwz) || 1e-6;
-          // Map to [0,1]: 1 at full pinch (dist≈0), 0 when dist≈PINCH_REF_RATIO3D * palmWidth3D
-          const raw3D = clamp(1 - (dist3D / (palmWidth3D * PINCH_REF_RATIO3D)), 0, 1);
-          pinchInput = raw3D;
+          // Proximity score: 1 at full pinch, 0 when apart by ref ratio
+          const prox = clamp(1 - (dist3D / (palmWidth3D * PINCH_REF_RATIO3D)), 0, 1);
+          // Alignment score: thumb/index tips facing each other (opposite directions) along the line connecting them
+          const w3 = h.world[3], w7 = h.world[7]; // DIP joints
+          const vThumb = { x: w4.x - w3.x, y: w4.y - w3.y, z: w4.z - w3.z };
+          const vIndex = { x: w8.x - w7.x, y: w8.y - w7.y, z: w8.z - w7.z };
+          const vTI = { x: w8.x - w4.x, y: w8.y - w4.y, z: w8.z - w4.z };
+          const nvThumb = (() => { const m = Math.hypot(vThumb.x, vThumb.y, vThumb.z) || 1; return { x: vThumb.x/m, y: vThumb.y/m, z: vThumb.z/m }; })();
+          const nvIndex = (() => { const m = Math.hypot(vIndex.x, vIndex.y, vIndex.z) || 1; return { x: vIndex.x/m, y: vIndex.y/m, z: vIndex.z/m }; })();
+          const nvTI = (() => { const m = Math.hypot(vTI.x, vTI.y, vTI.z) || 1; return { x: vTI.x/m, y: vTI.y/m, z: vTI.z/m }; })();
+          // Want thumb pointing toward index (nvThumb · nvTI ≈ 1) and index pointing toward thumb (nvIndex · -nvTI ≈ 1)
+          const a1 = clamp(nvThumb.x*nvTI.x + nvThumb.y*nvTI.y + nvThumb.z*nvTI.z, -1, 1);
+          const a2 = clamp(nvIndex.x*(-nvTI.x) + nvIndex.y*(-nvTI.y) + nvIndex.z*(-nvTI.z), -1, 1);
+          const align = clamp((a1 + a2) * 0.5 * 0.5 + 0.5, 0, 1); // map [-1,1] avg to [0,1]
+          pinchInput = clamp(PINCH_PROX_WEIGHT * prox + PINCH_ALIGN_WEIGHT * align, 0, 1);
           // Store a unitless distance ratio for potential debugging/telemetry
           h.rawPinchDist = dist3D / palmWidth3D;
         } else {
