@@ -101,7 +101,7 @@
   <header>
     <div class="left">
       <span class="badge">Hand Tracker</span>
-      <div class="small">Pinch thumb + index to interact. Grab with one hand; pinch with the other to resize. Enable Draw Mode to sketch; release to stop.</div>
+      <div class="small">Pinch thumb + index to interact. Grab with one hand; twist your wrist to rotate; move other hand up/down to resize. Enable Draw Mode to sketch; release to stop.</div>
     </div>
     <div class="controls">
       <button id="btnStart" class="btn">Enable Camera</button>
@@ -138,7 +138,7 @@
   </header>
 
   <div class="stage" id="stage">
-    <div class="hint">🤏 Grab with one hand; move other hand up/down to resize</div>
+    <div class="hint">🤏 Grab with one hand; twist wrist to rotate; move other hand up/down to resize</div>
     <video id="video" class="layer hidden" playsinline muted></video>
     <canvas id="sketch" class="layer"></canvas>
     <canvas id="canvas" class="layer"></canvas>
@@ -199,7 +199,12 @@ let allowSecondHand = true;
 
 // Pointer + landmark smoothing (One Euro filter) — multi-hand
 const MAX_HANDS = 2;
-/** @typedef {{x:number,y:number,valid:boolean,lmFilters:null|Array<{fx:OneEuro1D,fy:OneEuro1D}>,isPinching:boolean,wasPinching:boolean,pinchStrength:number,rawPinchDist:number}} HandState */
+/** @typedef {{
+ *  x:number,y:number,valid:boolean,
+ *  lmFilters:null|Array<{fx:OneEuro1D,fy:OneEuro1D}>,
+ *  isPinching:boolean,wasPinching:boolean,pinchStrength:number,rawPinchDist:number,
+ *  prevRawX?:number, prevRawY?:number, gain?:number, angle?:number
+ * }} HandState */
 /** @type {Array<HandState>} */
 let hands = Array.from({ length: MAX_HANDS }, () => ({
   x: 0, y: 0, valid: false,
@@ -236,6 +241,9 @@ let resizeBaseDist = 0;     // normalized distance at start of resize (legacy)
 let resizeBaseW = 0, resizeBaseH = 0; // widget size at start of resize
 let resizeStartY = 0;       // vertical baseline for up/down resize
 let nextId = 1;
+// Rotation state while grabbing
+let grabStartAngle = 0;
+let grabStartRot = 0;
 
 // Drawing state
 let drawMode = false;
@@ -284,6 +292,13 @@ function normToPx(nx, ny) {
   const px = (1 - nx) * overlay.width;
   const py = ny * overlay.height;
   return [px, py];
+}
+
+// Angle helpers
+function wrapAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
 }
 
 // One Euro filter implementation for smoother, responsive tracking
@@ -342,11 +357,11 @@ function ensureLmFiltersForHand(handIdx, count) {
 function spawnWidget(kind, x, y) {
   const baseSize = Math.max(60, Math.min(overlay.width, overlay.height) * 0.08);
   if (kind === 'circle') {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0 });
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0, rot: 0 });
   } else if (kind === 'note') {
-    widgets.push({ id: nextId++, x, y, w: baseSize * 1.6, h: baseSize * 1.1, kind, vx: 0, vy: 0, text: 'Note' });
+    widgets.push({ id: nextId++, x, y, w: baseSize * 1.6, h: baseSize * 1.1, kind, vx: 0, vy: 0, text: 'Note', rot: 0 });
   } else {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0 });
+    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0, rot: 0 });
   }
 }
 
@@ -362,7 +377,7 @@ function clearWidgets() {
   widgets = [];
 }
 
-const HIT_EXPAND = 24 * devicePixelRatio; // larger hit targets for easier grabs
+const HIT_EXPAND = 36 * devicePixelRatio; // larger hit targets for easier grabs
 let grabOffsetX = 0, grabOffsetY = 0;    // preserve offset when grabbing
 
 function pickWidget(px, py) {
@@ -373,15 +388,18 @@ function pickWidget(px, py) {
       const dx = px - w.x, dy = py - w.y;
       if (Math.hypot(dx, dy) <= w.w * 0.5 + HIT_EXPAND) return w.id;
     } else {
-      // square or note are rectangles
+      // square or note are rectangles — account for rotation
+      const rot = w.rot || 0;
+      const dx = px - w.x, dy = py - w.y;
+      const cos = Math.cos(-rot), sin = Math.sin(-rot);
+      const lx = dx * cos - dy * sin; // rotate point into widget-local frame
+      const ly = dx * sin + dy * cos;
       if (
-        px >= w.x - w.w/2 - HIT_EXPAND &&
-        px <= w.x + w.w/2 + HIT_EXPAND &&
-        py >= w.y - w.h/2 - HIT_EXPAND &&
-        py <= w.y + w.h/2 + HIT_EXPAND
-      ) {
-        return w.id;
-      }
+        lx >= -w.w/2 - HIT_EXPAND &&
+        lx <=  w.w/2 + HIT_EXPAND &&
+        ly >= -w.h/2 - HIT_EXPAND &&
+        ly <=  w.h/2 + HIT_EXPAND
+      ) return w.id;
     }
   }
   return null;
@@ -405,6 +423,7 @@ function drawWidgets(ctx) {
   for (const w of widgets) {
     ctx.save();
     ctx.translate(w.x, w.y);
+    if (w.rot) ctx.rotate(w.rot);
     // cards glow
     ctx.shadowColor = 'rgba(0,0,0,0.5)';
     ctx.shadowBlur = 18 * devicePixelRatio;
@@ -564,16 +583,32 @@ async function frame() {
         }));
         const tip8 = smoothed[8];
         const tip4 = smoothed[4];
-        const [px, py] = normToPx(tip8.x, tip8.y);
+        const [rawPx, rawPy] = normToPx(tip8.x, tip8.y);
         const h = hands[i];
-        h.x = clamp(px, 0, overlay.width);
-        h.y = clamp(py, 0, overlay.height);
-        h.valid = true;
-
-        // Dynamic pinch mapping using palm width as reference
+        // Orientation + palm reference
         const mcp5 = smoothed[5];
         const mcp17 = smoothed[17];
         const palmWidth = Math.hypot(mcp5.x - mcp17.x, mcp5.y - mcp17.y) || 0.001;
+        h.angle = Math.atan2(mcp17.y - mcp5.y, mcp17.x - mcp5.x);
+        // Depth-invariant pointer gain using palm size
+        if (h.prevRawX == null || h.prevRawY == null) {
+          h.prevRawX = rawPx; h.prevRawY = rawPy;
+          h.x = clamp(rawPx, 0, overlay.width);
+          h.y = clamp(rawPy, 0, overlay.height);
+          h.gain = 1.0;
+        } else {
+          const dx = rawPx - h.prevRawX;
+          const dy = rawPy - h.prevRawY;
+          h.prevRawX = rawPx; h.prevRawY = rawPy;
+          const TARGET_PALM = 0.095; // constant mapping across depth
+          const desiredGain = clamp(TARGET_PALM / palmWidth, 0.7, 2.2);
+          h.gain = h.gain == null ? desiredGain : lerp(h.gain, desiredGain, 0.25);
+          h.x = clamp((h.x ?? rawPx) + dx * h.gain, 0, overlay.width);
+          h.y = clamp((h.y ?? rawPy) + dy * h.gain, 0, overlay.height);
+        }
+        h.valid = true;
+
+        // Dynamic pinch mapping using palm width as reference
         const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized
         const baseline = clamp(palmWidth * 0.45, 0.04, 0.14);
         const mapped = clamp((baseline - dist) / baseline, 0, 1);
@@ -641,13 +676,13 @@ async function frame() {
         } else {
           // Grab with one hand; resize with the other (if enabled)
           if (grabbedId == null) {
-            // Look for a pinch start over a widget on allowed hand(s)
+            // Look for any active pinch over a widget on allowed hand(s)
             const primary = primaryHandIndex();
             const candidates = allowSecondHand ? [0, 1] : (primary != null ? [primary] : []);
             for (const i of candidates) {
               const h = hands[i];
               if (!h || !h.valid) continue;
-              if (h.isPinching && !h.wasPinching) {
+              if (h.isPinching) {
                 const hit = pickWidget(h.x, h.y);
                 if (hit != null) {
                   const w = widgets.find(v => v.id === hit);
@@ -657,6 +692,9 @@ async function frame() {
                     grabOffsetX = w.x - h.x;
                     grabOffsetY = w.y - h.y;
                     w.vx = 0; w.vy = 0;
+                    // initialize rotation baseline on grab
+                    grabStartAngle = hands[i].angle || 0;
+                    grabStartRot = w.rot || 0;
                   }
                   break;
                 }
@@ -673,6 +711,11 @@ async function frame() {
               // Move while grab hand keeps pinching
               if (gh.isPinching) {
                 moveWidget(grabbedId, gh.x + grabOffsetX, gh.y + grabOffsetY);
+                // Rotate with wrist twist while grabbing
+                const curAngle = gh.angle || 0;
+                const delta = wrapAngle(curAngle - grabStartAngle);
+                const ROT_GAIN = 1.0;
+                w.rot = wrapAngle((grabStartRot || 0) + delta * ROT_GAIN);
               } else {
                 // Release
                 const releasedId = grabbedId;
@@ -735,6 +778,9 @@ async function frame() {
         hands[i].isPinching = false;
         hands[i].pinchOnCount = 0;
         hands[i].pinchOffCount = 0;
+        hands[i].prevRawX = undefined;
+        hands[i].prevRawY = undefined;
+        hands[i].gain = 1.0;
       }
       grabbedId = null;
       grabOffsetX = 0; grabOffsetY = 0;
