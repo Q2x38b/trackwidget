@@ -223,6 +223,11 @@ const three = {
 const threeState = {
   grabbed: false,
   grabbedObj: null,
+  handIdx: null,
+  basePalmQuat: null,   // {x,y,z,w} at grab start
+  baseObjQuat: null,    // THREE.Quaternion clone at grab start
+  baseAngle: 0,         // 2D palm roll angle at grab start (fallback)
+  baseObjEulerZ: 0,     // object euler z at grab start (fallback)
 };
 
 // Compute a palm orientation quaternion (stubbed to identity unless world landmarks exist)
@@ -366,6 +371,18 @@ function beginThreeGrab(handIdx, object3D, opts = {}) {
   if (!object3D) return;
   threeState.grabbed = true;
   threeState.grabbedObj = object3D;
+  threeState.handIdx = handIdx;
+  const h = (handIdx == null) ? null : hands[handIdx];
+  // Cache baselines for rotation
+  if (THREE_NS && object3D) {
+    threeState.baseObjQuat = object3D.quaternion.clone();
+    threeState.baseObjEulerZ = object3D.rotation.z;
+  } else {
+    threeState.baseObjQuat = null;
+    threeState.baseObjEulerZ = 0;
+  }
+  threeState.basePalmQuat = h?.quat ? { x: h.quat.x, y: h.quat.y, z: h.quat.z, w: h.quat.w } : null;
+  threeState.baseAngle = h?.angle || 0;
 }
 
 function updateThreeDragFromPixels(px, py) {
@@ -376,12 +393,68 @@ function updateThreeDragFromPixels(px, py) {
 function endThreeGrab() {
   threeState.grabbed = false;
   threeState.grabbedObj = null;
+  threeState.handIdx = null;
+  threeState.basePalmQuat = null;
+  threeState.baseObjQuat = null;
+  threeState.baseAngle = 0;
+  threeState.baseObjEulerZ = 0;
 }
 
 function handleThreeInteractions(results) {
-  // Minimal: when rotate3DOnly is true (default), we don't modify 3D objects here.
-  // This function exists so the main loop can safely call it.
   if (!THREE_NS || !three.objects.length) return;
+
+  // Helper to rotate grabbed object according to current hand orientation
+  const applyRotationFromHand = (h) => {
+    if (!threeState.grabbed || !threeState.grabbedObj) return;
+    // Prefer full palm quaternion if available; else fall back to 2D roll angle around camera Z
+    if (h?.quat && threeState.basePalmQuat && threeState.baseObjQuat) {
+      const qBasePalm = new THREE_NS.Quaternion(
+        threeState.basePalmQuat.x,
+        threeState.basePalmQuat.y,
+        threeState.basePalmQuat.z,
+        threeState.basePalmQuat.w
+      );
+      const qNowPalm = new THREE_NS.Quaternion(h.quat.x, h.quat.y, h.quat.z, h.quat.w);
+      // Relative rotation in camera space: qRel = qNow * inverse(qBase)
+      const qRel = qNowPalm.clone().multiply(qBasePalm.clone().invert());
+      // Apply delta before base to rotate in world axes
+      const out = qRel.clone().multiply(threeState.baseObjQuat);
+      threeState.grabbedObj.quaternion.copy(out);
+    } else {
+      // Fallback: twist around camera Z using 2D palm angle
+      const curAngle = h?.angle || 0;
+      const delta = wrapAngle(curAngle - (threeState.baseAngle || 0));
+      threeState.grabbedObj.rotation.z = threeState.baseObjEulerZ + delta;
+    }
+  };
+
+  // 1) If currently grabbed: update or release
+  if (threeState.grabbed) {
+    const hi = threeState.handIdx;
+    const h = (hi == null) ? null : hands[hi];
+    if (!h || !h.valid || !h.isPinching) {
+      endThreeGrab();
+      return;
+    }
+    applyRotationFromHand(h);
+    return;
+  }
+
+  // 2) Not grabbed: look for pinch-start over a 3D object
+  for (let i = 0; i < MAX_HANDS; i++) {
+    const h = hands[i];
+    if (!h || !h.valid) continue;
+    // Start only on fresh pinch onset to avoid sticky grabs
+    if (h.isPinching && !h.wasPinching) {
+      // Raycast from pointer position
+      const px = h.x, py = h.y;
+      const hit = raycast3DFromPixels(px, py);
+      if (hit) {
+        beginThreeGrab(i, hit, { px, py });
+        return; // grab only one per frame
+      }
+    }
+  }
 }
 
 // Pointer + landmark smoothing (One Euro filter) — multi-hand
@@ -390,6 +463,7 @@ const MAX_HANDS = 2;
  *  x:number,y:number,valid:boolean,
  *  lmFilters:null|Array<{fx:OneEuro1D,fy:OneEuro1D}>,
  *  isPinching:boolean,wasPinching:boolean,pinchStrength:number,rawPinchDist:number,
+ *  pinchFiltered:number,
  *  prevRawX?:number, prevRawY?:number, gain?:number, angle?:number,
  *  world?: Array<{x:number,y:number,z:number}>|null, quat?: any
  * }} HandState */
@@ -403,15 +477,16 @@ let hands = Array.from({ length: MAX_HANDS }, () => ({
   rawPinchDist: 0,
   pinchOnCount: 0,
   pinchOffCount: 0,
+  pinchFiltered: 0,
 }));
 let lastFilterTime = null;
 const ONE_EURO_CFG = { minCutoff: 1.4, beta: 0.8, dCutoff: 1.0 };
 
-// Pinch detection thresholds and debounce
-// Dynamic pinch mapping + hysteresis + short debounce for stability
-const PINCH_ON = 0.58;
-const PINCH_OFF = 0.40;
-const PINCH_ON_FRAMES = 3;  // consecutive frames required to start pinch
+// Pinch detection thresholds and debounce (tuned for better responsiveness)
+// Smoother signal + slightly lower ON threshold + shorter debounce
+const PINCH_ON = 0.50;
+const PINCH_OFF = 0.42;
+const PINCH_ON_FRAMES = 2;  // consecutive frames required to start pinch
 const PINCH_OFF_FRAMES = 2; // consecutive frames required to end pinch
 
 // Widgets state
@@ -814,8 +889,13 @@ async function frame() {
 
         // Dynamic pinch mapping using palm width as reference
         const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized
-        const baseline = clamp(palmWidth * 0.45, 0.04, 0.14);
-        const mapped = clamp((baseline - dist) / baseline, 0, 1);
+        // Use a more stable baseline using smoothed palm width with tighter bounds
+        const baseline = clamp(palmWidth * 0.48, 0.045, 0.13);
+        const rawPinch = clamp((baseline - dist) / baseline, 0, 1);
+        // Low-pass the pinch scalar to reduce flicker, but keep responsive
+        const alpha = 0.35; // higher = more responsive; tuned via tests
+        h.pinchFiltered = (h.pinchFiltered == null) ? rawPinch : (h.pinchFiltered + alpha * (rawPinch - h.pinchFiltered));
+        const mapped = h.pinchFiltered;
         const was = h.wasPinching;
 
         // Debounced hysteresis
@@ -892,7 +972,8 @@ async function frame() {
             for (const i of candidates) {
               const h = hands[i];
               if (!h || !h.valid) continue;
-              if (h.isPinching) {
+              // begin 2D grab only on pinch onset and only if not on a 3D object
+              if (h.isPinching && !h.wasPinching) {
                 const hit = pickWidget(h.x, h.y, dynamicHitExpand(h));
                 if (hit != null) {
                   const w = widgets.find(v => v.id === hit);
@@ -945,7 +1026,7 @@ async function frame() {
                   const minSize = 40 * devicePixelRatio;
                   const maxSize = Math.min(overlay.width, overlay.height) * 0.8;
                   if (allowSecondHand && other !== grabHand && oh.isPinching) {
-                    if (resizeHand == null) {
+                    if (resizeHand == null && !oh.wasPinching) {
                       // Begin resize
                       resizeHand = other;
                       resizeStartY = oh.y;
