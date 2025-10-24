@@ -488,6 +488,9 @@ const PINCH_ON = 0.50;
 const PINCH_OFF = 0.42;
 const PINCH_ON_FRAMES = 2;  // consecutive frames required to start pinch
 const PINCH_OFF_FRAMES = 2; // consecutive frames required to end pinch
+// Reference ratio for 3D pinch metric: when index-thumb distance equals
+// PINCH_REF_RATIO3D * palmWidth3D, pinchStrength≈0. Higher makes pinch easier to trigger.
+const PINCH_REF_RATIO3D = 0.82;
 
 // Widgets state
 /**
@@ -887,14 +890,32 @@ async function frame() {
         }
         h.valid = true;
 
-        // Dynamic pinch mapping using palm width as reference
-        const dist = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized
-        // Use a more stable baseline using smoothed palm width with tighter bounds
-        const baseline = clamp(palmWidth * 0.48, 0.045, 0.13);
-        const rawPinch = clamp((baseline - dist) / baseline, 0, 1);
+        // Orientation-invariant pinch metric
+        // Prefer 3D world landmark distances normalized by 3D palm width; fallback to 2D
+        const dist2D = Math.hypot((tip4.x - tip8.x), (tip4.y - tip8.y)); // normalized image-space
+        let pinchInput = 0;
+        if (h.world && h.world.length >= 18) {
+          const w4 = h.world[4], w8 = h.world[8], w5 = h.world[5], w17w = h.world[17];
+          const dx = w4.x - w8.x, dy = w4.y - w8.y, dz = w4.z - w8.z;
+          const dist3D = Math.hypot(dx, dy, dz);
+          const pwx = w5.x - w17w.x, pwy = w5.y - w17w.y, pwz = w5.z - w17w.z;
+          const palmWidth3D = Math.hypot(pwx, pwy, pwz) || 1e-6;
+          // Map to [0,1]: 1 at full pinch (dist≈0), 0 when dist≈PINCH_REF_RATIO3D * palmWidth3D
+          const raw3D = clamp(1 - (dist3D / (palmWidth3D * PINCH_REF_RATIO3D)), 0, 1);
+          pinchInput = raw3D;
+          // Store a unitless distance ratio for potential debugging/telemetry
+          h.rawPinchDist = dist3D / palmWidth3D;
+        } else {
+          // 2D fallback, normalized by 2D palm width
+          const baseline2D = clamp(palmWidth * 0.48, 0.045, 0.13);
+          const raw2D = clamp((baseline2D - dist2D) / baseline2D, 0, 1);
+          pinchInput = raw2D;
+          h.rawPinchDist = dist2D; // keep legacy unit when 3D unavailable
+        }
+
         // Low-pass the pinch scalar to reduce flicker, but keep responsive
         const alpha = 0.35; // higher = more responsive; tuned via tests
-        h.pinchFiltered = (h.pinchFiltered == null) ? rawPinch : (h.pinchFiltered + alpha * (rawPinch - h.pinchFiltered));
+        h.pinchFiltered = (h.pinchFiltered == null) ? pinchInput : (h.pinchFiltered + alpha * (pinchInput - h.pinchFiltered));
         const mapped = h.pinchFiltered;
         const was = h.wasPinching;
 
@@ -915,7 +936,6 @@ async function frame() {
           h.isPinching = !(h.pinchOffCount >= PINCH_OFF_FRAMES);
         }
         h.pinchStrength = mapped;
-        h.rawPinchDist = dist;
 
         // Estimate a palm orientation quaternion for 3D mapping
         h.quat = computePalmQuaternion(h.world, smoothed, h.quat);
