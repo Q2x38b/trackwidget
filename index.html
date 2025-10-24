@@ -219,6 +219,171 @@ const three = {
   hovered: null,
 };
 
+// Lightweight 3D interaction state so the rest of the app doesn't crash
+const threeState = {
+  grabbed: false,
+  grabbedObj: null,
+};
+
+// Compute a palm orientation quaternion (stubbed to identity unless world landmarks exist)
+function computePalmQuaternion(worldLandmarks, smoothed2D, prevQuat) {
+  // If world landmarks are available, estimate a stable orientation from wrist (0), index MCP (5), pinky MCP (17)
+  try {
+    if (worldLandmarks && worldLandmarks.length >= 18) {
+      const wrist = worldLandmarks[0];
+      const indexMcp = worldLandmarks[5];
+      const pinkyMcp = worldLandmarks[17];
+      // Build tangent axes in camera space
+      const vx = { x: indexMcp.x - wrist.x, y: indexMcp.y - wrist.y, z: indexMcp.z - wrist.z };
+      const vy = { x: pinkyMcp.x - wrist.x, y: pinkyMcp.y - wrist.y, z: pinkyMcp.z - wrist.z };
+      // Normal via cross product
+      const nz = {
+        x: vx.y * vy.z - vx.z * vy.y,
+        y: vx.z * vy.x - vx.x * vy.z,
+        z: vx.x * vy.y - vx.y * vy.x,
+      };
+      // Normalize vectors
+      const norm = (v) => { const m = Math.hypot(v.x, v.y, v.z) || 1; return { x: v.x / m, y: v.y / m, z: v.z / m }; };
+      const z = norm(nz);
+      const x = norm(vx);
+      // Orthonormal y = z × x
+      const y = norm({ x: z.y * x.z - z.z * x.y, y: z.z * x.x - z.x * x.z, z: z.x * x.y - z.y * x.x });
+      // Rotation matrix columns (x, y, z)
+      const m00 = x.x, m01 = y.x, m02 = z.x;
+      const m10 = x.y, m11 = y.y, m12 = z.y;
+      const m20 = x.z, m21 = y.z, m22 = z.z;
+      // Convert to quaternion (right-handed)
+      const t = m00 + m11 + m22;
+      let qw, qx, qy, qz;
+      if (t > 0) {
+        const s = Math.sqrt(t + 1.0) * 2; // s = 4*qw
+        qw = 0.25 * s;
+        qx = (m21 - m12) / s;
+        qy = (m02 - m20) / s;
+        qz = (m10 - m01) / s;
+      } else if (m00 > m11 && m00 > m22) {
+        const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2; // s = 4*qx
+        qw = (m21 - m12) / s;
+        qx = 0.25 * s;
+        qy = (m01 + m10) / s;
+        qz = (m02 + m20) / s;
+      } else if (m11 > m22) {
+        const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2; // s = 4*qy
+        qw = (m02 - m20) / s;
+        qx = (m01 + m10) / s;
+        qy = 0.25 * s;
+        qz = (m12 + m21) / s;
+      } else {
+        const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2; // s = 4*qz
+        qw = (m10 - m01) / s;
+        qx = (m02 + m20) / s;
+        qy = (m12 + m21) / s;
+        qz = 0.25 * s;
+      }
+      return { x: qx, y: qy, z: qz, w: qw };
+    }
+  } catch (_) {
+    // fall through to identity
+  }
+  // Identity quaternion as safe default
+  return prevQuat || { x: 0, y: 0, z: 0, w: 1 };
+}
+
+// Lazy-load three.js from CDN; proceed gracefully if it fails
+async function loadThree() {
+  const CDN_CANDIDATES = [
+    'https://unpkg.com/three@0.157.0/build/three.module.js',
+    'https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.module.js',
+    'https://esm.run/three@0.157.0'
+  ];
+  for (const url of CDN_CANDIDATES) {
+    try {
+      THREE_NS = await withTimeout(import(url), 10000, 'Load three.js');
+      return;
+    } catch (_) {
+      // try next
+    }
+  }
+  // If we cannot load three.js, keep THREE_NS as null — all 3D paths will no-op
+  THREE_NS = null;
+}
+
+function initThree() {
+  if (!THREE_NS) return;
+  // Basic scene/camera/renderer
+  three.scene = new THREE_NS.Scene();
+  const rect = stage.getBoundingClientRect();
+  three.camera = new THREE_NS.PerspectiveCamera(60, Math.max(1, rect.width) / Math.max(1, rect.height), 0.1, 100);
+  three.camera.position.set(0, 0, 3);
+  three.renderer = new THREE_NS.WebGLRenderer({ canvas: webgl, antialias: true, alpha: true });
+  three.renderer.setPixelRatio(devicePixelRatio);
+  three.renderer.setSize(rect.width, rect.height, false);
+  three.raycaster = new THREE_NS.Raycaster();
+  // Lights
+  const ambient = new THREE_NS.AmbientLight(0xffffff, 0.6);
+  const dir = new THREE_NS.DirectionalLight(0xffffff, 0.6);
+  dir.position.set(1, 2, 3);
+  three.scene.add(ambient, dir);
+}
+
+function renderThree() {
+  if (!THREE_NS || !three.renderer || !three.scene || !three.camera) return;
+  three.renderer.render(three.scene, three.camera);
+}
+
+function spawn3D(kind = 'cube') {
+  if (!THREE_NS || !three.scene) return;
+  let mesh;
+  if (kind === 'sphere') {
+    mesh = new THREE_NS.Mesh(
+      new THREE_NS.SphereGeometry(0.25, 32, 16),
+      new THREE_NS.MeshStandardMaterial({ color: 0x5ac8fa, metalness: 0.1, roughness: 0.35 })
+    );
+  } else {
+    mesh = new THREE_NS.Mesh(
+      new THREE_NS.BoxGeometry(0.4, 0.4, 0.4),
+      new THREE_NS.MeshStandardMaterial({ color: 0x34c759, metalness: 0.1, roughness: 0.45 })
+    );
+  }
+  mesh.position.set((Math.random() - 0.5) * 1.4, (Math.random() - 0.5) * 0.9, 0);
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+  three.scene.add(mesh);
+  three.objects.push(mesh);
+}
+
+function raycast3DFromPixels(px, py) {
+  if (!THREE_NS || !three.camera || !three.renderer || !three.raycaster) return null;
+  const rect = webgl.getBoundingClientRect();
+  const nx = (px / (rect.width * devicePixelRatio)) * 2 - 1;
+  const ny = -(py / (rect.height * devicePixelRatio)) * 2 + 1;
+  three.raycaster.setFromCamera({ x: nx, y: ny }, three.camera);
+  const hits = three.raycaster.intersectObjects(three.objects, false);
+  return hits.length ? hits[0].object : null;
+}
+
+function beginThreeGrab(handIdx, object3D, opts = {}) {
+  if (!object3D) return;
+  threeState.grabbed = true;
+  threeState.grabbedObj = object3D;
+}
+
+function updateThreeDragFromPixels(px, py) {
+  // Optional: implement screen-space dragging. For now, keep as no-op unless rotate3DOnly is disabled.
+  if (!THREE_NS || !threeState.grabbed || !threeState.grabbedObj) return;
+}
+
+function endThreeGrab() {
+  threeState.grabbed = false;
+  threeState.grabbedObj = null;
+}
+
+function handleThreeInteractions(results) {
+  // Minimal: when rotate3DOnly is true (default), we don't modify 3D objects here.
+  // This function exists so the main loop can safely call it.
+  if (!THREE_NS || !three.objects.length) return;
+}
+
 // Pointer + landmark smoothing (One Euro filter) — multi-hand
 const MAX_HANDS = 2;
 /** @typedef {{
@@ -869,6 +1034,13 @@ async function frame() {
 async function enableCamera() {
   if (cameraStream) return;
   try {
+    // Helpful compatibility notice
+    if (!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)) {
+      throw new Error('Camera API not available. Use a modern browser (Chrome, Edge, Safari).');
+    }
+    if (!window.isSecureContext && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
+      statusEl.innerHTML = '<span class="err">Insecure context:</span> camera requires HTTPS or localhost.';
+    }
     statusEl.textContent = 'Requesting camera…';
     const preferred = {
       audio: false,
@@ -886,7 +1058,14 @@ async function enableCamera() {
     statusEl.textContent = 'Camera on (video hidden).';
   } catch (err) {
     console.error(err);
-    statusEl.innerHTML = `<span class="err">Camera error:</span> ${err?.message || err}`;
+    const msg = err?.message || String(err);
+    if (/denied|not allowed|permission/i.test(msg)) {
+      statusEl.innerHTML = '<span class="err">Camera blocked:</span> grant permission and retry.';
+    } else if (/insecure|https/i.test(msg)) {
+      statusEl.innerHTML = '<span class="err">Use HTTPS or localhost for camera access.</span>';
+    } else {
+      statusEl.innerHTML = `<span class="err">Camera error:</span> ${msg}`;
+    }
   }
 }
 
@@ -916,7 +1095,7 @@ async function initHandLandmarker() {
   }
   if (!visionModule) throw lastErr || new Error('Failed to load tasks-vision module');
 
-  const { FilesetResolver, HandLandmarker } = visionModule;
+  const { FilesetResolver, HandLandmarker, VisionRunningMode } = visionModule;
 
   // Resolve WASM files (try multiple CDNs)
   const WASM_ROOTS = [
@@ -945,13 +1124,14 @@ async function initHandLandmarker() {
   handLandmarker = await withTimeout(
     HandLandmarker.createFromOptions(filesetResolver, {
       baseOptions: {
+        // Use float16 model hosted by Google; fallback is handled by resolver/CDN
         modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
       },
-      runningMode: 'VIDEO',
+      runningMode: VisionRunningMode.VIDEO,
       numHands: 2,
-      minHandDetectionConfidence: 0.7,
-      minHandPresenceConfidence: 0.7,
-      minTrackingConfidence: 0.7
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6
     }),
     60000,
     'Create HandLandmarker'
