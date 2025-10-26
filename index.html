@@ -94,6 +94,18 @@
     padding: 6px 10px; border-radius: 999px; font-size: 12px; color: #cdd3e2;
     backdrop-filter: blur(8px);
   }
+
+  /* Sidebar layout */
+  .main { display: grid; grid-template-columns: var(--sidebar-w, 340px) 1fr; gap: 12px; min-height: 0; }
+  .sidebar {
+    background: linear-gradient(180deg, #171a23 0%, #121520 100%);
+    border: 1px solid #22283a; border-radius: 14px; padding: 12px; overflow: auto;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 14px 40px rgba(0,0,0,0.35);
+    transition: opacity 160ms ease;
+  }
+  .main.sidebar-collapsed { --sidebar-w: 0px; }
+  .main.sidebar-collapsed .sidebar { opacity: 0; pointer-events: none; }
+  .header-actions { display: flex; gap: 8px; align-items: center; }
 </style>
 </head>
 <body>
@@ -103,52 +115,61 @@
       <span class="badge">Hand Tracker</span>
       <div class="small">Pinch thumb + index to interact. Grab with one hand; twist your wrist to rotate; move other hand up/down to resize. Enable Draw Mode to sketch; release to stop.</div>
     </div>
-    <div class="controls">
-      <button id="btnStart" class="btn">Enable Camera</button>
-      <button id="btnReset" class="btn">Reset Widgets</button>
-      <button id="btnSpawn" class="btn">Add Widget</button>
-      <button id="btnClear" class="btn">Clear Widgets</button>
-
-      <span class="small" style="margin-left:8px;">| 3D</span>
-      <button id="btnAddCube" class="btn">Add Cube</button>
-      <button id="btnAddSphere" class="btn">Add Sphere</button>
-      <button id="toggleRotate3D" class="toggle" data-on="true" aria-pressed="true" title="When on, hand only rotates 3D objects (no 2D rotation)">3D Rotate-only</button>
-      <button id="togglePointer" class="toggle" data-on="true" aria-pressed="true">Show Pointer</button>
-      <span class="small" style="margin-left:8px;">| Drawing</span>
-      <button id="btnDrawMode" class="toggle" data-on="false" aria-pressed="false">Draw Mode</button>
-      <button id="btnEraser" class="toggle" data-on="false" aria-pressed="false" disabled>Eraser</button>
-      <input id="colorPicker" type="color" value="#ff375f" title="Brush color" />
-      <input id="brushSize" type="range" min="2" max="36" value="8" title="Brush size" />
-      <button id="btnClearSketch" class="btn">Clear Drawing</button>
-      <button id="btnSave" class="btn">Save PNG</button>
-
-      <span class="small" style="margin-left:8px;">| Smooth</span>
-      <label class="small" title="Smoothing cutoff (lower = smoother)">
-        cutoff
-        <input id="smoothingCutoff" type="range" min="0.8" max="4" step="0.1" value="1.4" />
-      </label>
-      <label class="small" title="Smoothing beta (higher = more responsive)">
-        beta
-        <input id="smoothingBeta" type="range" min="0" max="1.5" step="0.05" value="0.8" />
-      </label>
-      <span class="small" style="margin-left:8px;">| Pointer</span>
-      <label class="small" title="Pointer size">
-        size
-        <input id="pointerSize" type="range" min="4" max="20" step="1" value="7" />
-      </label>
-
-      <span class="small" style="margin-left:8px;">| Resize</span>
-      <button id="toggleSecondHand" class="toggle" data-on="true" aria-pressed="true" title="Allow second hand for resizing">2nd-hand Resize</button>
+    <div class="header-actions">
+      <button id="btnToggleSidebar" class="btn" title="Show/Hide Controls">☰ Controls</button>
     </div>
   </header>
 
-  <div class="stage" id="stage">
-    <div class="hint">🤏 Grab with one hand; twist wrist to rotate; move other hand up/down to resize</div>
-    <video id="video" class="layer hidden" playsinline muted></video>
-    <canvas id="webgl" class="layer"></canvas>
-    <canvas id="sketch" class="layer"></canvas>
-    <canvas id="canvas" class="layer"></canvas>
-    <canvas id="overlay" class="layer overlay"></canvas>
+  <div class="main" id="main">
+    <aside class="sidebar" id="sidebar">
+      <div class="controls">
+        <button id="btnStart" class="btn">Enable Camera</button>
+        <button id="btnReset" class="btn">Reset Widgets</button>
+        <button id="btnSpawn" class="btn">Add Widget</button>
+        <button id="btnClear" class="btn">Clear Widgets</button>
+        <button id="toggleCamWidget" class="toggle" data-on="false" aria-pressed="false" title="Show camera picture-in-picture">Camera PIP</button>
+
+        <span class="small" style="margin-left:8px;">| 3D</span>
+        <button id="btnAddCube" class="btn">Add Cube</button>
+        <button id="btnAddSphere" class="btn">Add Sphere</button>
+        <button id="toggleRotate3D" class="toggle" data-on="true" aria-pressed="true" title="When on, hand only rotates 3D objects (no 2D rotation)">3D Rotate-only</button>
+        <button id="togglePointer" class="toggle" data-on="true" aria-pressed="true">Show Pointer</button>
+
+        <span class="small" style="margin-left:8px;">| Drawing</span>
+        <button id="btnDrawMode" class="toggle" data-on="false" aria-pressed="false">Draw Mode</button>
+        <button id="btnEraser" class="toggle" data-on="false" aria-pressed="false" disabled>Eraser</button>
+        <input id="colorPicker" type="color" value="#ff375f" title="Brush color" />
+        <input id="brushSize" type="range" min="2" max="36" value="8" title="Brush size" />
+        <button id="btnClearSketch" class="btn">Clear Drawing</button>
+        <button id="btnSave" class="btn">Save PNG</button>
+
+        <span class="small" style="margin-left:8px;">| Smooth</span>
+        <label class="small" title="Smoothing cutoff (lower = smoother)">
+          cutoff
+          <input id="smoothingCutoff" type="range" min="0.8" max="4" step="0.1" value="1.4" />
+        </label>
+        <label class="small" title="Smoothing beta (higher = more responsive)">
+          beta
+          <input id="smoothingBeta" type="range" min="0" max="1.5" step="0.05" value="0.8" />
+        </label>
+        <span class="small" style="margin-left:8px;">| Pointer</span>
+        <label class="small" title="Pointer size">
+          size
+          <input id="pointerSize" type="range" min="4" max="20" step="1" value="7" />
+        </label>
+
+        <span class="small" style="margin-left:8px;">| Resize</span>
+        <button id="toggleSecondHand" class="toggle" data-on="true" aria-pressed="true" title="Allow second hand for resizing">2nd-hand Resize</button>
+      </div>
+    </aside>
+    <div class="stage" id="stage">
+      <div class="hint">🤏 Grab with one hand; twist wrist to rotate; move other hand up/down to resize</div>
+      <video id="video" class="layer hidden" playsinline muted></video>
+      <canvas id="webgl" class="layer"></canvas>
+      <canvas id="sketch" class="layer"></canvas>
+      <canvas id="canvas" class="layer"></canvas>
+      <canvas id="overlay" class="layer overlay"></canvas>
+    </div>
   </div>
 
   <footer>
@@ -180,6 +201,8 @@ const webgl = document.getElementById('webgl');      // 3D layer
 const sketch = document.getElementById('sketch');     // persistent drawing layer
 const canvas = document.getElementById('canvas');     // interaction layer (widgets)
 const overlay = document.getElementById('overlay');   // pointer & debug
+const mainEl = document.getElementById('main');
+const btnToggleSidebar = document.getElementById('btnToggleSidebar');
 const btnStart = document.getElementById('btnStart');
 const btnReset = document.getElementById('btnReset');
 const btnSpawn = document.getElementById('btnSpawn');
@@ -199,6 +222,7 @@ const smoothingBetaInput = document.getElementById('smoothingBeta');
 const pointerSizeInput = document.getElementById('pointerSize');
 const stage = document.getElementById('stage');
 const toggleSecondHand = document.getElementById('toggleSecondHand');
+const toggleCamWidget = document.getElementById('toggleCamWidget');
 
 let showPointer = true;
 let handLandmarker = null;
@@ -207,6 +231,8 @@ let running = false;
 let lastVideoTime = -1;
 let allowSecondHand = true;
 let rotate3DOnly = true; // when true, wrist twist rotates only 3D objects (2D widgets won't rotate)
+let camWidgetId = null; // id of camera PIP widget if present
+let lastNormLandmarks = []; // normalized landmark arrays for each hand (for PIP)
 
 // Three.js state
 let THREE_NS = null; // assigned after dynamic import
@@ -976,7 +1002,52 @@ function drawWidgets(ctx) {
     ctx.shadowBlur = 18 * devicePixelRatio;
     ctx.lineWidth = 2 * devicePixelRatio;
 
-    if (w.kind === 'circle') {
+    if (w.kind === 'camera') {
+      const ww = w.w, hh = w.h;
+      const radius = 14 * devicePixelRatio;
+      // Frame
+      roundRectPath(ctx, -ww/2, -hh/2, ww, hh, radius);
+      ctx.fillStyle = 'rgba(20,24,40,0.9)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(90,200,250,0.35)';
+      ctx.stroke();
+      // Clip and draw mirrored video
+      ctx.save();
+      roundRectPath(ctx, -ww/2, -hh/2, ww, hh, radius);
+      ctx.clip();
+      if (cameraStream && video.readyState >= 2) {
+        ctx.save();
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, -(-ww/2), -hh/2, -ww, hh); // mirror by negative width
+        ctx.restore();
+      } else {
+        // Placeholder
+        const grad = ctx.createLinearGradient(-ww/2, -hh/2, ww/2, hh/2);
+        grad.addColorStop(0, '#0e1320');
+        grad.addColorStop(1, '#0b0e15');
+        ctx.fillStyle = grad;
+        ctx.fillRect(-ww/2, -hh/2, ww, hh);
+      }
+      // Draw landmark dots
+      if (lastNormLandmarks && lastNormLandmarks.length) {
+        for (let i = 0; i < Math.min(MAX_HANDS, lastNormLandmarks.length); i++) {
+          const lms = lastNormLandmarks[i];
+          if (!lms || !lms.length) continue;
+          ctx.save();
+          ctx.fillStyle = i === 0 ? 'rgba(90,200,250,0.95)' : 'rgba(52,199,89,0.95)';
+          const r = Math.max(2, 2.2 * devicePixelRatio);
+          for (const p of lms) {
+            const lx = (1 - p.x) * ww - ww/2;
+            const ly = p.y * hh - hh/2;
+            ctx.beginPath();
+            ctx.arc(lx, ly, r, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+      }
+      ctx.restore();
+    } else if (w.kind === 'circle') {
       const r = w.w * 0.5;
       const g = (grabbedId === w.id) ? 'rgba(90,200,250,0.9)' : 'rgba(90,200,250,0.35)';
       ctx.beginPath();
