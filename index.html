@@ -221,13 +221,27 @@ const three = {
 
 // Lightweight 3D interaction state so the rest of the app doesn't crash
 const threeState = {
+  // Active drag/translate state (requires pinch)
   grabbed: false,
   grabbedObj: null,
   handIdx: null,
-  basePalmQuat: null,   // {x,y,z,w} at grab start
-  baseObjQuat: null,    // THREE.Quaternion clone at grab start
-  baseAngle: 0,         // 2D palm roll angle at grab start (fallback)
-  baseObjEulerZ: 0,     // object euler z at grab start (fallback)
+  interaction: 'idle', // 'idle' | 'translate'
+  dragPlane: null,     // THREE.Plane
+  dragOffset: null,    // THREE.Vector3 in world space
+
+  // Selection + rotation state (does not require pinch once selected)
+  selectedObj: null,
+  selectedHandIdx: null,
+  selectedAt: 0,
+
+  // Rotation baselines for selected/rotation and fallback
+  basePalmQuat: null,   // {x,y,z,w} at selection start
+  baseObjQuat: null,    // THREE.Quaternion clone at selection start
+  baseAngle: 0,         // 2D palm roll angle at selection start (fallback)
+  baseObjEulerZ: 0,     // object euler z at selection start (fallback)
+
+  // Pending pick to disambiguate select vs drag
+  pendingPick: null, // { handIdx, object3D, startPx, startPy, startTime }
 };
 
 // --- 3D math helpers for stable palm orientation ---
@@ -392,6 +406,73 @@ function renderThree() {
   three.renderer.render(three.scene, three.camera);
 }
 
+// Project a world-space point to overlay pixel coordinates
+function projectWorldToOverlay(vWorld) {
+  if (!THREE_NS || !three.camera) return null;
+  const v = vWorld.clone();
+  v.project(three.camera);
+  const x = (v.x * 0.5 + 0.5) * overlay.width;
+  const y = (1 - (v.y * 0.5 + 0.5)) * overlay.height;
+  return { x, y, w: v.z };
+}
+
+// Compute convex hull (Monotone chain) of 2D points
+function convexHull2D(points) {
+  const pts = points.map(p => ({ x: p.x, y: p.y })).sort((a, b) => a.x === b.x ? a.y - b.y : a.x - b.x);
+  if (pts.length <= 3) return pts;
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  upper.pop(); lower.pop();
+  return lower.concat(upper);
+}
+
+// Draw 2D glow outline for the selected 3D object by projecting its world-space AABB corners
+function drawSelectedObjectOutline2D(ctx) {
+  if (!THREE_NS || !threeState.selectedObj || !three.camera) return;
+  const obj = threeState.selectedObj;
+  const box = new THREE_NS.Box3().setFromObject(obj);
+  if (!box || !box.isBox3) return;
+  const corners = [
+    new THREE_NS.Vector3(box.min.x, box.min.y, box.min.z),
+    new THREE_NS.Vector3(box.min.x, box.min.y, box.max.z),
+    new THREE_NS.Vector3(box.min.x, box.max.y, box.min.z),
+    new THREE_NS.Vector3(box.min.x, box.max.y, box.max.z),
+    new THREE_NS.Vector3(box.max.x, box.min.y, box.min.z),
+    new THREE_NS.Vector3(box.max.x, box.min.y, box.max.z),
+    new THREE_NS.Vector3(box.max.x, box.max.y, box.min.z),
+    new THREE_NS.Vector3(box.max.x, box.max.y, box.max.z),
+  ];
+  const pts = [];
+  for (const c of corners) {
+    const p = projectWorldToOverlay(c);
+    if (p) pts.push(p);
+  }
+  if (pts.length < 3) return;
+  const hull = convexHull2D(pts);
+  if (!hull.length) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(hull[0].x, hull[0].y);
+  for (let i = 1; i < hull.length; i++) ctx.lineTo(hull[i].x, hull[i].y);
+  ctx.closePath();
+  ctx.shadowColor = 'rgba(90,200,250,0.6)';
+  ctx.shadowBlur = 22 * devicePixelRatio;
+  ctx.lineWidth = Math.max(2, 2 * devicePixelRatio);
+  ctx.strokeStyle = 'rgba(90,200,250,0.95)';
+  ctx.stroke();
+  ctx.restore();
+}
+
 function spawn3D(kind = 'cube') {
   if (!THREE_NS || !three.scene) return;
   let mesh;
@@ -424,32 +505,58 @@ function raycast3DFromPixels(px, py) {
 }
 
 function beginThreeGrab(handIdx, object3D, opts = {}) {
-  if (!object3D) return;
+  if (!object3D || !THREE_NS || !three.camera) return;
   threeState.grabbed = true;
   threeState.grabbedObj = object3D;
   threeState.handIdx = handIdx;
-  const h = (handIdx == null) ? null : hands[handIdx];
-  // Cache baselines for rotation
-  if (THREE_NS && object3D) {
-    threeState.baseObjQuat = object3D.quaternion.clone();
-    threeState.baseObjEulerZ = object3D.rotation.z;
+  threeState.interaction = 'translate';
+  const now = performance.now();
+  threeState.grabbedAt = now;
+  threeState.lastPinchSeenAt = now;
+
+  // Build a screen-parallel drag plane through the object's current position
+  const camDir = new THREE_NS.Vector3();
+  three.camera.getWorldDirection(camDir); // points toward -Z
+  const planeNormal = camDir.clone();
+  const planePoint = new THREE_NS.Vector3().setFromMatrixPosition(object3D.matrixWorld);
+  threeState.dragPlane = new THREE_NS.Plane().setFromNormalAndCoplanarPoint(planeNormal, planePoint);
+
+  // Initial intersection point and offset
+  const rect = webgl.getBoundingClientRect();
+  const px = opts.px ?? 0;
+  const py = opts.py ?? 0;
+  const nx = (px / (rect.width * devicePixelRatio)) * 2 - 1;
+  const ny = -(py / (rect.height * devicePixelRatio)) * 2 + 1;
+  three.raycaster.setFromCamera({ x: nx, y: ny }, three.camera);
+  const hitPoint = new THREE_NS.Vector3();
+  if (three.raycaster.ray.intersectPlane(threeState.dragPlane, hitPoint)) {
+    const objPos = planePoint.clone();
+    threeState.dragOffset = hitPoint.clone().sub(objPos);
   } else {
-    threeState.baseObjQuat = null;
-    threeState.baseObjEulerZ = 0;
+    threeState.dragOffset = new THREE_NS.Vector3(0, 0, 0);
   }
-  threeState.basePalmQuat = h?.quat ? { x: h.quat.x, y: h.quat.y, z: h.quat.z, w: h.quat.w } : null;
-  threeState.baseAngle = h?.angle || 0;
 }
 
 function updateThreeDragFromPixels(px, py) {
-  // Optional: implement screen-space dragging. For now, keep as no-op unless rotate3DOnly is disabled.
-  if (!THREE_NS || !threeState.grabbed || !threeState.grabbedObj) return;
+  if (!THREE_NS || !threeState.grabbed || !threeState.grabbedObj || !threeState.dragPlane) return;
+  const rect = webgl.getBoundingClientRect();
+  const nx = (px / (rect.width * devicePixelRatio)) * 2 - 1;
+  const ny = -(py / (rect.height * devicePixelRatio)) * 2 + 1;
+  three.raycaster.setFromCamera({ x: nx, y: ny }, three.camera);
+  const hitPoint = new THREE_NS.Vector3();
+  if (three.raycaster.ray.intersectPlane(threeState.dragPlane, hitPoint)) {
+    const desired = hitPoint.sub(threeState.dragOffset || new THREE_NS.Vector3());
+    threeState.grabbedObj.position.copy(desired);
+  }
 }
 
 function endThreeGrab() {
   threeState.grabbed = false;
   threeState.grabbedObj = null;
   threeState.handIdx = null;
+  threeState.interaction = 'idle';
+  threeState.dragPlane = null;
+  threeState.dragOffset = null;
   threeState.basePalmQuat = null;
   threeState.baseObjQuat = null;
   threeState.baseAngle = 0;
@@ -459,56 +566,135 @@ function endThreeGrab() {
 function handleThreeInteractions(results) {
   if (!THREE_NS || !three.objects.length) return;
 
-  // Helper to rotate grabbed object according to current hand orientation
-  const applyRotationFromHand = (h) => {
-    if (!threeState.grabbed || !threeState.grabbedObj) return;
-    // Prefer full palm quaternion if available; else fall back to 2D roll angle around camera Z
-    if (h?.quat && threeState.basePalmQuat && threeState.baseObjQuat) {
-      const qBasePalm = new THREE_NS.Quaternion(
-        threeState.basePalmQuat.x,
-        threeState.basePalmQuat.y,
-        threeState.basePalmQuat.z,
-        threeState.basePalmQuat.w
-      );
-      const qNowPalm = new THREE_NS.Quaternion(h.quat.x, h.quat.y, h.quat.z, h.quat.w);
-      // Relative rotation in camera space: qRel = qNow * inverse(qBase)
+  const now = performance.now();
+
+  // Helpers
+  const applyRotationToObject = (object3D, basePalmQuat, baseObjQuat, baseAngle, baseObjEulerZ, hand) => {
+    if (!object3D) return;
+    if (hand?.quat && basePalmQuat && baseObjQuat) {
+      const qBasePalm = new THREE_NS.Quaternion(basePalmQuat.x, basePalmQuat.y, basePalmQuat.z, basePalmQuat.w);
+      const qNowPalm = new THREE_NS.Quaternion(hand.quat.x, hand.quat.y, hand.quat.z, hand.quat.w);
       const qRel = qNowPalm.clone().multiply(qBasePalm.clone().invert());
-      // Apply delta before base to rotate in world axes
-      const out = qRel.clone().multiply(threeState.baseObjQuat);
-      threeState.grabbedObj.quaternion.copy(out);
+      const target = qRel.clone().multiply(baseObjQuat);
+      // Smooth to target to reduce jitter
+      object3D.quaternion.slerp(target, ROTATION_SLERP_ALPHA);
     } else {
-      // Fallback: twist around camera Z using 2D palm angle
-      const curAngle = h?.angle || 0;
-      const delta = wrapAngle(curAngle - (threeState.baseAngle || 0));
-      threeState.grabbedObj.rotation.z = threeState.baseObjEulerZ + delta;
+      const curAngle = hand?.angle || 0;
+      const delta = wrapAngle(curAngle - (baseAngle || 0));
+      const desiredZ = (baseObjEulerZ || 0) + delta;
+      // Smooth scalar angle a bit
+      object3D.rotation.z = lerp(object3D.rotation.z, desiredZ, 0.22);
     }
   };
 
-  // 1) If currently grabbed: update or release
-  if (threeState.grabbed) {
+  // 0) If translating (grabbed): keep moving while pinching, with short sticky grace
+  if (threeState.grabbed && threeState.grabbedObj && threeState.interaction === 'translate') {
     const hi = threeState.handIdx;
     const h = (hi == null) ? null : hands[hi];
-    if (!h || !h.valid || !h.isPinching) {
-      endThreeGrab();
-      return;
+    const stillPinching = !!(h && h.valid && h.isPinching);
+    if (stillPinching) {
+      threeState.lastPinchSeenAt = now;
+      updateThreeDragFromPixels(h.x, h.y);
+    } else {
+      // Allow brief occlusion while continuing move
+      if (now - (threeState.lastPinchSeenAt || 0) <= STICKY_GRAB_MS && h && h.valid) {
+        updateThreeDragFromPixels(h.x, h.y);
+      } else {
+        endThreeGrab();
+      }
     }
-    applyRotationFromHand(h);
-    return;
+    return; // translation takes priority
   }
 
-  // 2) Not grabbed: look for pinch-start over a 3D object
+  // 1) If an object is selected: rotate it using the controlling hand, even without pinch
+  if (threeState.selectedObj) {
+    let hi = threeState.selectedHandIdx;
+    // If selected hand lost, pick any valid hand
+    if (hi == null || !hands[hi] || !hands[hi].valid) {
+      hi = hands[0]?.valid ? 0 : (hands[1]?.valid ? 1 : null);
+    }
+    const h = (hi == null) ? null : hands[hi];
+    if (h && h.valid) {
+      applyRotationToObject(
+        threeState.selectedObj,
+        threeState.basePalmQuat,
+        threeState.baseObjQuat,
+        threeState.baseAngle,
+        threeState.baseObjEulerZ,
+        h
+      );
+    }
+
+    // If user pinches on the selected object and moves enough, switch to translate
+    if (h && h.valid && h.isPinching && !h.wasPinching) {
+      const hit = raycast3DFromPixels(h.x, h.y);
+      if (hit === threeState.selectedObj) {
+        // Start pending pick for translate vs tap
+        threeState.pendingPick = { handIdx: hi, object3D: hit, startPx: h.x, startPy: h.y, startTime: now };
+      }
+    }
+    if (threeState.pendingPick) {
+      const pp = threeState.pendingPick;
+      const hh = hands[pp.handIdx];
+      if (hh && hh.valid && hh.isPinching) {
+        const move = Math.hypot(hh.x - pp.startPx, hh.y - pp.startPy);
+        if (move >= TRANSLATE_MOVE_START_PX) {
+          // Begin translation of the selected object
+          threeState.selectedObj = pp.object3D; // already selected
+          beginThreeGrab(pp.handIdx, pp.object3D, { px: hh.x, py: hh.y });
+          threeState.pendingPick = null;
+          return;
+        }
+      } else if (hh && !hh.isPinching) {
+        // Pinch released without enough move -> treat as no-op (still selected)
+        threeState.pendingPick = null;
+      }
+    }
+    // Continue, but do not return — allow selection updates below
+  }
+
+  // 2) No active translation: look for pinch onset to select or start translate
   for (let i = 0; i < MAX_HANDS; i++) {
     const h = hands[i];
     if (!h || !h.valid) continue;
-    // Start only on fresh pinch onset to avoid sticky grabs
     if (h.isPinching && !h.wasPinching) {
-      // Raycast from pointer position
       const px = h.x, py = h.y;
       const hit = raycast3DFromPixels(px, py);
       if (hit) {
-        beginThreeGrab(i, hit, { px, py });
-        return; // grab only one per frame
+        // Start pending pick; decide select vs translate later based on movement/time
+        threeState.pendingPick = { handIdx: i, object3D: hit, startPx: px, startPy: py, startTime: now };
+        // Also cache rotation baselines in case this becomes a selection
+        threeState.baseObjQuat = hit.quaternion.clone();
+        threeState.baseObjEulerZ = hit.rotation.z;
+        threeState.basePalmQuat = h?.quat ? { x: h.quat.x, y: h.quat.y, z: h.quat.z, w: h.quat.w } : null;
+        threeState.baseAngle = h?.angle || 0;
+        threeState.selectedHandIdx = i;
+        return;
       }
+    }
+  }
+
+  // 3) Resolve pending pick if pinch released quickly -> selection
+  if (threeState.pendingPick) {
+    const pp = threeState.pendingPick;
+    const h = hands[pp.handIdx];
+    const elapsed = now - pp.startTime;
+    const moved = h ? Math.hypot((h.x ?? pp.startPx) - pp.startPx, (h.y ?? pp.startPy) - pp.startPy) : 0;
+    const stillPinching = !!(h && h.valid && h.isPinching);
+    if (stillPinching) {
+      if (moved >= TRANSLATE_MOVE_START_PX) {
+        beginThreeGrab(pp.handIdx, pp.object3D, { px: h.x, py: h.y });
+        threeState.pendingPick = null;
+        return;
+      }
+    } else {
+      // Pinch ended — if quick and not moved: select
+      if (elapsed <= SELECT_TAP_MAX_TIME_MS && moved <= SELECT_TAP_MAX_MOVE_PX) {
+        threeState.selectedObj = pp.object3D;
+        threeState.selectedAt = now;
+        // Baselines already cached on pinch onset
+      }
+      threeState.pendingPick = null;
     }
   }
 }
@@ -546,12 +732,21 @@ const PINCH_ON_FRAMES = 2;  // consecutive frames required to start pinch
 const PINCH_OFF_FRAMES = 2; // consecutive frames required to end pinch
 // Reference ratio for 3D pinch metric: when index-thumb distance equals
 // PINCH_REF_RATIO3D * palmWidth3D, pinchStrength≈0. Higher makes pinch easier to trigger.
-const PINCH_REF_RATIO3D = 0.82;
+const PINCH_REF_RATIO3D = 1.05; // slightly easier to trigger when foreshortened
 // Multi-cue pinch scoring weights (proximity vs. finger alignment)
-const PINCH_PROX_WEIGHT = 0.65;
-const PINCH_ALIGN_WEIGHT = 0.35;
+const PINCH_PROX_WEIGHT = 0.75; // emphasize proximity for head-on hands
+const PINCH_ALIGN_WEIGHT = 0.25;
 // Palm quaternion temporal smoothing for stable 3D rotation
 const PALM_SLERP_ALPHA = 0.25;
+// Additional object rotation smoothing to reduce jitter
+const ROTATION_SLERP_ALPHA = 0.2;
+
+// Selection/drag thresholds
+const SELECT_TAP_MAX_TIME_MS = 280;
+const SELECT_TAP_MAX_MOVE_PX = 18 * devicePixelRatio;
+const TRANSLATE_MOVE_START_PX = 12 * devicePixelRatio;
+// Small grace period after pinch is lost to keep translating if hand still valid
+const STICKY_GRAB_MS = 200;
 
 // Widgets state
 /**
@@ -854,6 +1049,9 @@ function drawOverlay() {
   const ctx = overlay.getContext('2d');
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
+  // Selected 3D object outline glow
+  drawSelectedObjectOutline2D(ctx);
+
   if (!showPointer) return;
   const primary = primaryHandIndex();
   for (let i = 0; i < MAX_HANDS; i++) {
@@ -1054,7 +1252,7 @@ async function frame() {
             }
           }
         } else {
-          // 3D interactions first, then 2D widgets if no 3D grab
+          // 3D interactions: selection/rotation/translate based on pinch logic
           handleThreeInteractions(results);
 
           // If no 3D object is grabbed, enable 2D widgets: grab with one hand; resize with the other (if enabled)
@@ -1150,11 +1348,13 @@ async function frame() {
       // Overlay + status
       drawOverlay();
       if (threeState.grabbed) {
-        statusEl.textContent = rotate3DOnly ? 'Rotating 3D' : 'Manipulating 3D';
+        statusEl.textContent = 'Moving 3D';
       } else if (grabbedId != null && resizeHand != null) {
         statusEl.textContent = 'Resizing';
       } else if (grabbedId != null) {
         statusEl.textContent = 'Grabbing';
+      } else if (threeState.selectedObj) {
+        statusEl.textContent = 'Rotating 3D';
       } else if (hands.some((h, idx) => h.isPinching && (allowSecondHand || idx === primaryHandIndex()))) {
         statusEl.textContent = 'Pinching';
       } else {
