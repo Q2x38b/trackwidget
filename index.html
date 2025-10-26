@@ -661,14 +661,17 @@ function handleThreeInteractions(results) {
       const px = h.x, py = h.y;
       const hit = raycast3DFromPixels(px, py);
       if (hit) {
-        // Start pending pick; decide select vs translate later based on movement/time
-        threeState.pendingPick = { handIdx: i, object3D: hit, startPx: px, startPy: py, startTime: now };
-        // Also cache rotation baselines in case this becomes a selection
+        // Immediately select so wrist twist rotates while pinching; may switch to translate on move
+        threeState.selectedObj = hit;
+        threeState.selectedAt = now;
+        threeState.selectedHandIdx = i;
+        // Cache rotation baselines
         threeState.baseObjQuat = hit.quaternion.clone();
         threeState.baseObjEulerZ = hit.rotation.z;
         threeState.basePalmQuat = h?.quat ? { x: h.quat.x, y: h.quat.y, z: h.quat.z, w: h.quat.w } : null;
         threeState.baseAngle = h?.angle || 0;
-        threeState.selectedHandIdx = i;
+        // Start pending pick to resolve translate if user moves enough
+        threeState.pendingPick = { handIdx: i, object3D: hit, startPx: px, startPy: py, startTime: now };
         return;
       }
     }
@@ -747,6 +750,14 @@ const SELECT_TAP_MAX_MOVE_PX = 18 * devicePixelRatio;
 const TRANSLATE_MOVE_START_PX = 12 * devicePixelRatio;
 // Small grace period after pinch is lost to keep translating if hand still valid
 const STICKY_GRAB_MS = 200;
+// Pointer gain scaling across depth (move farther -> higher gain)
+const POINTER_GAIN_2D_MIN = 0.7;
+const POINTER_GAIN_2D_MAX = 3.0;   // allow more gain when far
+const POINTER_GAIN_3D_MIN = 0.9;
+const POINTER_GAIN_3D_MAX = 4.0;   // higher ceiling using 3D palm width
+const TARGET_PALM_2D = 0.095;      // normalized 2D palm width target
+const TARGET_PALM_3D = 0.085;      // approximate real palm width in meters
+const GAIN_LERP_ALPHA = 0.35;      // responsiveness of gain changes
 
 // Widgets state
 /**
@@ -1131,7 +1142,7 @@ async function frame() {
         h.angle = Math.atan2(mcp17.y - mcp5.y, mcp17.x - mcp5.x);
         // Store world landmarks if available for 3D orientation
         h.world = results.worldLandmarks?.[i] || null;
-        // Depth-invariant pointer gain using palm size
+        // Depth-aware pointer gain using palm size (2D fallback, 3D preferred)
         if (h.prevRawX == null || h.prevRawY == null) {
           h.prevRawX = rawPx; h.prevRawY = rawPy;
           h.x = clamp(rawPx, 0, overlay.width);
@@ -1141,9 +1152,17 @@ async function frame() {
           const dx = rawPx - h.prevRawX;
           const dy = rawPy - h.prevRawY;
           h.prevRawX = rawPx; h.prevRawY = rawPy;
-          const TARGET_PALM = 0.095; // constant mapping across depth
-          const desiredGain = clamp(TARGET_PALM / palmWidth, 0.7, 2.2);
-          h.gain = h.gain == null ? desiredGain : lerp(h.gain, desiredGain, 0.25);
+          // 2D palm-based gain (fallback)
+          let desiredGain2D = clamp(TARGET_PALM_2D / palmWidth, POINTER_GAIN_2D_MIN, POINTER_GAIN_2D_MAX);
+          let desiredGain = desiredGain2D;
+          // If 3D landmarks available, boost gain using 3D palm width (more reliable with depth)
+          if (h.world && h.world.length >= 18) {
+            const w5 = h.world[5], w17w = h.world[17];
+            const pw3d = Math.hypot(w5.x - w17w.x, w5.y - w17w.y, w5.z - w17w.z) || 1e-6;
+            const desiredGain3D = clamp(TARGET_PALM_3D / pw3d, POINTER_GAIN_3D_MIN, POINTER_GAIN_3D_MAX);
+            desiredGain = Math.max(desiredGain2D, desiredGain3D);
+          }
+          h.gain = h.gain == null ? desiredGain : lerp(h.gain, desiredGain, GAIN_LERP_ALPHA);
           h.x = clamp((h.x ?? rawPx) + dx * h.gain, 0, overlay.width);
           h.y = clamp((h.y ?? rawPy) + dy * h.gain, 0, overlay.height);
         }
