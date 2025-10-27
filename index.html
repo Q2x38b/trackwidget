@@ -466,24 +466,44 @@ function convexHull2D(points) {
 function drawSelectedObjectOutline2D(ctx) {
   if (!THREE_NS || !threeState.selectedObj || !three.camera) return;
   const obj = threeState.selectedObj;
-  const box = new THREE_NS.Box3().setFromObject(obj);
-  if (!box || !box.isBox3) return;
-  const corners = [
-    new THREE_NS.Vector3(box.min.x, box.min.y, box.min.z),
-    new THREE_NS.Vector3(box.min.x, box.min.y, box.max.z),
-    new THREE_NS.Vector3(box.min.x, box.max.y, box.min.z),
-    new THREE_NS.Vector3(box.min.x, box.max.y, box.max.z),
-    new THREE_NS.Vector3(box.max.x, box.min.y, box.min.z),
-    new THREE_NS.Vector3(box.max.x, box.min.y, box.max.z),
-    new THREE_NS.Vector3(box.max.x, box.max.y, box.min.z),
-    new THREE_NS.Vector3(box.max.x, box.max.y, box.max.z),
-  ];
   const pts = [];
-  for (const c of corners) {
-    const p = projectWorldToOverlay(c);
-    if (p) pts.push(p);
+  // Try to use projected geometry vertices for a tighter 2D footprint
+  try {
+    obj.updateWorldMatrix(true, false);
+    obj.traverse((node) => {
+      if (!node.isMesh || !node.geometry || !node.geometry.attributes || !node.geometry.attributes.position) return;
+      const pos = node.geometry.attributes.position;
+      const step = Math.max(1, Math.floor(pos.count / 400)); // sample cap for perf
+      const vLocal = new THREE_NS.Vector3();
+      const vWorld = new THREE_NS.Vector3();
+      for (let i = 0; i < pos.count; i += step) {
+        vLocal.fromBufferAttribute(pos, i);
+        vWorld.copy(vLocal).applyMatrix4(node.matrixWorld);
+        const p = projectWorldToOverlay(vWorld);
+        if (p) pts.push(p);
+      }
+    });
+  } catch (_) {}
+  if (pts.length < 3) {
+    // Fallback to projected AABB corners if geometry sampling failed
+    const box = new THREE_NS.Box3().setFromObject(obj);
+    if (!box || !box.isBox3) return;
+    const corners = [
+      new THREE_NS.Vector3(box.min.x, box.min.y, box.min.z),
+      new THREE_NS.Vector3(box.min.x, box.min.y, box.max.z),
+      new THREE_NS.Vector3(box.min.x, box.max.y, box.min.z),
+      new THREE_NS.Vector3(box.min.x, box.max.y, box.max.z),
+      new THREE_NS.Vector3(box.max.x, box.min.y, box.min.z),
+      new THREE_NS.Vector3(box.max.x, box.min.y, box.max.z),
+      new THREE_NS.Vector3(box.max.x, box.max.y, box.min.z),
+      new THREE_NS.Vector3(box.max.x, box.max.y, box.max.z),
+    ];
+    for (const c of corners) {
+      const p = projectWorldToOverlay(c);
+      if (p) pts.push(p);
+    }
+    if (pts.length < 3) return;
   }
-  if (pts.length < 3) return;
   const hull = convexHull2D(pts);
   if (!hull.length) return;
   ctx.save();
@@ -613,6 +633,62 @@ function handleThreeInteractions(results) {
     }
   };
 
+  // A) Handle double-pinch gestures for select/unselect
+  for (let i = 0; i < MAX_HANDS; i++) {
+    const h = hands[i];
+    if (!h || !h.valid) continue;
+    if (h.doublePinchAt && (now - h.doublePinchAt) <= DOUBLE_PINCH_EVENT_WINDOW_MS) {
+      // Consume event
+      h.doublePinchAt = 0;
+      const px = h.doublePinchX, py = h.doublePinchY;
+      const hit = raycast3DFromPixels(px, py);
+      if (hit) {
+        if (threeState.selectedObj === hit) {
+          // Double-pinch on selected object -> unselect
+          threeState.selectedObj = null;
+          threeState.selectedHandIdx = null;
+          threeState.pendingPick = null;
+          threeState.basePalmQuat = null;
+          threeState.baseObjQuat = null;
+          threeState.baseAngle = 0;
+          threeState.baseObjEulerZ = 0;
+          return;
+        } else {
+          // Select this object
+          threeState.selectedObj = hit;
+          threeState.selectedAt = now;
+          // Prefer a non-pinching hand for rotation baseline
+          let rotIdx = null;
+          const other = i === 0 ? 1 : 0;
+          if (hands[other]?.valid && !hands[other].isPinching) rotIdx = other;
+          else if (!h.isPinching) rotIdx = i;
+          else if (hands[0]?.valid && !hands[0].isPinching) rotIdx = 0;
+          else if (hands[1]?.valid && !hands[1].isPinching) rotIdx = 1;
+          else rotIdx = i; // fallback
+          threeState.selectedHandIdx = rotIdx;
+          const rh = hands[rotIdx];
+          threeState.baseObjQuat = hit.quaternion.clone();
+          threeState.baseObjEulerZ = hit.rotation.z;
+          threeState.basePalmQuat = rh?.quat ? { x: rh.quat.x, y: rh.quat.y, z: rh.quat.z, w: rh.quat.w } : null;
+          threeState.baseAngle = rh?.angle || 0;
+          return;
+        }
+      } else {
+        // Double-pinch empty space -> unselect any current
+        if (threeState.selectedObj) {
+          threeState.selectedObj = null;
+          threeState.selectedHandIdx = null;
+          threeState.pendingPick = null;
+          threeState.basePalmQuat = null;
+          threeState.baseObjQuat = null;
+          threeState.baseAngle = 0;
+          threeState.baseObjEulerZ = 0;
+          return;
+        }
+      }
+    }
+  }
+
   // 0) If translating (grabbed): keep moving while pinching, with short sticky grace
   if (threeState.grabbed && threeState.grabbedObj && threeState.interaction === 'translate') {
     const hi = threeState.handIdx;
@@ -632,12 +708,17 @@ function handleThreeInteractions(results) {
     return; // translation takes priority
   }
 
-  // 1) If an object is selected: rotate it using the controlling hand, even without pinch
+  // 1) If an object is selected: rotate it using a non-pinching hand when possible
   if (threeState.selectedObj) {
-    let hi = threeState.selectedHandIdx;
-    // If selected hand lost, pick any valid hand
-    if (hi == null || !hands[hi] || !hands[hi].valid) {
-      hi = hands[0]?.valid ? 0 : (hands[1]?.valid ? 1 : null);
+    // Prefer a valid non-pinching hand
+    let hi = null;
+    const cands = [0,1];
+    for (const idx of cands) {
+      if (hands[idx]?.valid && !hands[idx].isPinching) { hi = idx; break; }
+    }
+    if (hi == null) {
+      // Fallback to previous selection hand or any valid
+      hi = (threeState.selectedHandIdx != null && hands[threeState.selectedHandIdx]?.valid) ? threeState.selectedHandIdx : (hands[0]?.valid ? 0 : (hands[1]?.valid ? 1 : null));
     }
     const h = (hi == null) ? null : hands[hi];
     if (h && h.valid) {
@@ -649,6 +730,7 @@ function handleThreeInteractions(results) {
         threeState.baseObjEulerZ,
         h
       );
+      threeState.selectedHandIdx = hi;
     }
 
     // If user pinches on the selected object and moves enough, switch to translate
@@ -679,23 +761,14 @@ function handleThreeInteractions(results) {
     // Continue, but do not return — allow selection updates below
   }
 
-  // 2) No active translation: look for pinch onset to select or start translate
+  // 2) No active translation: only allow pinch onset to start translate if on selected object
   for (let i = 0; i < MAX_HANDS; i++) {
     const h = hands[i];
     if (!h || !h.valid) continue;
     if (h.isPinching && !h.wasPinching) {
       const px = h.x, py = h.y;
       const hit = raycast3DFromPixels(px, py);
-      if (hit) {
-        // Immediately select so wrist twist rotates while pinching; may switch to translate on move
-        threeState.selectedObj = hit;
-        threeState.selectedAt = now;
-        threeState.selectedHandIdx = i;
-        // Cache rotation baselines
-        threeState.baseObjQuat = hit.quaternion.clone();
-        threeState.baseObjEulerZ = hit.rotation.z;
-        threeState.basePalmQuat = h?.quat ? { x: h.quat.x, y: h.quat.y, z: h.quat.z, w: h.quat.w } : null;
-        threeState.baseAngle = h?.angle || 0;
+      if (hit && threeState.selectedObj && hit === threeState.selectedObj) {
         // Start pending pick to resolve translate if user moves enough
         threeState.pendingPick = { handIdx: i, object3D: hit, startPx: px, startPy: py, startTime: now };
         return;
@@ -703,7 +776,7 @@ function handleThreeInteractions(results) {
     }
   }
 
-  // 3) Resolve pending pick if pinch released quickly -> selection
+  // 3) Resolve pending pick if pinch released quickly -> do nothing (selection is via double-pinch)
   if (threeState.pendingPick) {
     const pp = threeState.pendingPick;
     const h = hands[pp.handIdx];
@@ -717,12 +790,6 @@ function handleThreeInteractions(results) {
         return;
       }
     } else {
-      // Pinch ended — if quick and not moved: select
-      if (elapsed <= SELECT_TAP_MAX_TIME_MS && moved <= SELECT_TAP_MAX_MOVE_PX) {
-        threeState.selectedObj = pp.object3D;
-        threeState.selectedAt = now;
-        // Baselines already cached on pinch onset
-      }
       threeState.pendingPick = null;
     }
   }
@@ -749,6 +816,15 @@ let hands = Array.from({ length: MAX_HANDS }, () => ({
   pinchOnCount: 0,
   pinchOffCount: 0,
   pinchFiltered: 0,
+  pinchStartX: 0,
+  pinchStartY: 0,
+  pinchStartTime: 0,
+  lastPinchTapAt: 0,
+  lastPinchTapX: 0,
+  lastPinchTapY: 0,
+  doublePinchAt: 0,
+  doublePinchX: 0,
+  doublePinchY: 0,
 }));
 let lastFilterTime = null;
 const ONE_EURO_CFG = { minCutoff: 1.4, beta: 0.8, dCutoff: 1.0 };
@@ -768,11 +844,15 @@ const PINCH_ALIGN_WEIGHT = 0.25;
 // Palm quaternion temporal smoothing for stable 3D rotation
 const PALM_SLERP_ALPHA = 0.25;
 // Additional object rotation smoothing to reduce jitter
-const ROTATION_SLERP_ALPHA = 0.2;
+const ROTATION_SLERP_ALPHA = 0.35;
 
 // Selection/drag thresholds
 const SELECT_TAP_MAX_TIME_MS = 280;
 const SELECT_TAP_MAX_MOVE_PX = 18 * devicePixelRatio;
+// Double-pinch gesture timing
+const PINCH_TAP_MAX_TIME_MS = 220;           // Max duration for a pinch "tap"
+const DOUBLE_PINCH_MAX_GAP_MS = 300;         // Max gap between taps to count as double
+const DOUBLE_PINCH_EVENT_WINDOW_MS = 150;    // Window to consume double-pinch event
 const TRANSLATE_MOVE_START_PX = 12 * devicePixelRatio;
 // Small grace period after pinch is lost to keep translating if hand still valid
 const STICKY_GRAB_MS = 200;
@@ -922,13 +1002,20 @@ function ensureLmFiltersForHand(handIdx, count) {
 // Widget helpers
 function spawnWidget(kind, x, y) {
   const baseSize = Math.max(60, Math.min(overlay.width, overlay.height) * 0.08);
+  let widget;
   if (kind === 'circle') {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0, rot: 0 });
+    widget = { id: nextId++, x, y, w: baseSize, h: baseSize, kind, vx: 0, vy: 0, rot: 0 };
   } else if (kind === 'note') {
-    widgets.push({ id: nextId++, x, y, w: baseSize * 1.6, h: baseSize * 1.1, kind, vx: 0, vy: 0, text: 'Note', rot: 0 });
+    widget = { id: nextId++, x, y, w: baseSize * 1.6, h: baseSize * 1.1, kind, vx: 0, vy: 0, text: 'Note', rot: 0 };
+  } else if (kind === 'camera') {
+    const ww = Math.max(Math.min(overlay.width * 0.34, 560 * devicePixelRatio), 260 * devicePixelRatio);
+    const hh = Math.round(ww * 9 / 16);
+    widget = { id: nextId++, x, y, w: ww, h: hh, kind: 'camera', vx: 0, vy: 0, rot: 0 };
   } else {
-    widgets.push({ id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0, rot: 0 });
+    widget = { id: nextId++, x, y, w: baseSize, h: baseSize, kind: 'square', vx: 0, vy: 0, rot: 0 };
   }
+  widgets.push(widget);
+  return widget.id;
 }
 
 function resetWidgets() {
@@ -1194,6 +1281,7 @@ async function frame() {
       lastFilterTime = now;
 
       // For up to MAX_HANDS, smooth and populate state
+      const lastSmoothed = [];
       for (let i = 0; i < Math.min(MAX_HANDS, results.landmarks.length); i++) {
         const lms = results.landmarks[i];
         ensureLmFiltersForHand(i, lms.length);
@@ -1202,6 +1290,7 @@ async function frame() {
           x: filters[j].fx.filter(p.x, dt),
           y: filters[j].fy.filter(p.y, dt),
         }));
+        lastSmoothed[i] = smoothed;
         const tip8 = smoothed[8];
         const tip4 = smoothed[4];
         const [rawPx, rawPy] = normToPx(tip8.x, tip8.y);
@@ -1300,7 +1389,32 @@ async function frame() {
 
         // Estimate a palm orientation quaternion for 3D mapping
         h.quat = computePalmQuaternion(h.world, smoothed, h.quat);
+
+        // Pinch tap and double-pinch detection
+        if (h.isPinching && !was) {
+          h.pinchStartX = h.x; h.pinchStartY = h.y; h.pinchStartTime = now;
+        }
+        if (!h.isPinching && was) {
+          const elapsed = now - (h.pinchStartTime || now);
+          const moved = Math.hypot((h.x || 0) - (h.pinchStartX || 0), (h.y || 0) - (h.pinchStartY || 0));
+          if (elapsed <= PINCH_TAP_MAX_TIME_MS && moved <= SELECT_TAP_MAX_MOVE_PX) {
+            if (h.lastPinchTapAt && (now - h.lastPinchTapAt) <= DOUBLE_PINCH_MAX_GAP_MS) {
+              // Double pinch recognized
+              h.doublePinchAt = now;
+              h.doublePinchX = h.x;
+              h.doublePinchY = h.y;
+              h.lastPinchTapAt = 0;
+            } else {
+              h.lastPinchTapAt = now;
+              h.lastPinchTapX = h.x;
+              h.lastPinchTapY = h.y;
+            }
+          }
+          h.pinchStartTime = 0;
+        }
       }
+      // Update PiP landmarks with smoothed normalized positions
+      lastNormLandmarks = lastSmoothed;
 
       // Interaction
       const anyValid = hands.some(h => h.valid);
@@ -1737,6 +1851,35 @@ btnSave.addEventListener('click', () => {
   a.download = 'hand-canvas.png';
   a.click();
 });
+
+// Sidebar toggle
+if (btnToggleSidebar) {
+  btnToggleSidebar.addEventListener('click', () => {
+    mainEl.classList.toggle('sidebar-collapsed');
+  });
+}
+
+// Camera PiP toggle
+if (toggleCamWidget) {
+  toggleCamWidget.addEventListener('click', () => {
+    const willTurnOn = toggleCamWidget.dataset.on !== 'true';
+    toggleCamWidget.dataset.on = String(willTurnOn);
+    toggleCamWidget.setAttribute('aria-pressed', String(willTurnOn));
+    if (willTurnOn) {
+      if (camWidgetId == null) {
+        const ww = Math.min(overlay.width * 0.35, 480 * devicePixelRatio);
+        const x = overlay.width - ww - 24 * devicePixelRatio;
+        const y = 24 * devicePixelRatio + Math.min(overlay.height * 0.22, 160 * devicePixelRatio);
+        camWidgetId = spawnWidget('camera', x, y);
+      }
+    } else {
+      if (camWidgetId != null) {
+        widgets = widgets.filter(w => w.id !== camWidgetId);
+        camWidgetId = null;
+      }
+    }
+  });
+}
 
 // Toggle: allow/disallow second-hand resizing
 if (toggleSecondHand) {
